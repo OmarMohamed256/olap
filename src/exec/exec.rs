@@ -34,6 +34,7 @@ impl Bitmap {
         );
         let mut total_valid = 0;
 
+        // check if there is leftover rows
         if num_rows & 63 > 0 {
             num_words -= 1;
             let mask: u64 = (1u64 << (num_rows & 63)) - 1;
@@ -117,6 +118,7 @@ fn format_date(days: i32) -> String {
 }
 // One column's values plus validity. In execution it holds up to VECTOR_SIZE (2048) rows;
 // in storage, one Vector of num_rows rows is what a PAX column chunk encodes (see storage/pax.rs).
+#[derive(Debug, PartialEq)]
 pub struct Vector {
     pub data: VectorData, // values of one type
     pub validity: Bitmap, // one bit per value: which of those values are NULL

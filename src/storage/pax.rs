@@ -521,7 +521,16 @@ impl Vector {
     // Writes the chunk and returns its null_count for ChunkMetadata.
     // The count comes from the bitmap, so the footer can never disagree with the bytes.
     pub fn encode(&self, buffer: &mut Vec<u8>) -> u32 {
+        debug_assert_eq!(
+            self.validity.words.len(),
+            Bitmap::num_words(self.data.len())
+        );
+        let null_count = self.validity.null_count(self.data.len());
+        if null_count > 0 {
+            self.validity.encode(buffer);
+        }
         self.data.encode(buffer);
+        null_count as u32
     }
 
     // ty from the schema, num_rows from RowGroupMeta, null_count from ChunkMetadata.
@@ -533,7 +542,19 @@ impl Vector {
         num_rows: usize,
         null_count: u32,
     ) -> Result<Self, String> {
-        todo!()
+        // Same order as encode: [bitmap, only if null_count > 0][values].
+        let validity = if null_count > 0 {
+            let bitmap = Bitmap::decode(buffer, num_rows)?;
+            // The footer and the chunk must agree; this also rejects null_count > num_rows.
+            if bitmap.null_count(num_rows) != null_count as usize {
+                return Err("Chunk null count does not match the footer".to_string());
+            }
+            bitmap
+        } else {
+            Bitmap::all_valid(num_rows)
+        };
+        let data = VectorData::decode(buffer, ty, num_rows)?;
+        Ok(Vector { data, validity })
     }
 }
 // we want to pull the metadata, then stream chunks of Vectors at certain offsets
@@ -992,5 +1013,71 @@ mod tests {
         // A corrupted row count must fail cleanly, not reserve memory for it.
         let mut bytes: &[u8] = &buffer;
         assert!(Bitmap::decode(&mut bytes, u32::MAX as usize).is_err());
+    }
+
+    // 100 rows of i64 with NULLs at 0, 63 and 99 (NULL slots hold 0).
+    fn vector_with_nulls() -> Vector {
+        let mut validity = Bitmap::all_valid(100);
+        for i in [0, 63, 99] {
+            validity.set_null(i);
+        }
+        let values: Vec<i64> = (0..100)
+            .map(|i| if validity.is_valid(i) { i as i64 } else { 0 })
+            .collect();
+        Vector {
+            data: VectorData::Int64(values),
+            validity,
+        }
+    }
+
+    #[test]
+    fn vector_round_trip_with_nulls() {
+        let vector = vector_with_nulls();
+        let mut buffer: Vec<u8> = Vec::new();
+        let null_count = vector.encode(&mut buffer);
+        assert_eq!(null_count, 3);
+        assert_eq!(buffer.len(), 16 + 800); // 2 bitmap words, then 100 values
+
+        let mut bytes: &[u8] = &buffer;
+        let decoded = Vector::decode(&mut bytes, DataType::Int64, 100, null_count).unwrap();
+        assert_eq!(decoded, vector);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn vector_round_trip_no_nulls() {
+        let vector = Vector {
+            data: VectorData::Varchar(vec!["AIR".to_string(), "".to_string(), "café".to_string()]),
+            validity: Bitmap::all_valid(3),
+        };
+        let mut buffer: Vec<u8> = Vec::new();
+        let null_count = vector.encode(&mut buffer);
+        assert_eq!(null_count, 0);
+        assert_eq!(buffer.len(), 16 + 8); // no bitmap: 4 offsets, then 8 string bytes
+
+        let mut bytes: &[u8] = &buffer;
+        let decoded = Vector::decode(&mut bytes, DataType::Varchar, 3, null_count).unwrap();
+        assert_eq!(decoded, vector);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn vector_decode_null_count_mismatch() {
+        let mut buffer: Vec<u8> = Vec::new();
+        vector_with_nulls().encode(&mut buffer);
+
+        // The bitmap has 3 NULLs but the footer claims 5.
+        let mut bytes: &[u8] = &buffer;
+        assert!(Vector::decode(&mut bytes, DataType::Int64, 100, 5).is_err());
+    }
+
+    #[test]
+    fn vector_decode_truncated() {
+        let mut buffer: Vec<u8> = Vec::new();
+        vector_with_nulls().encode(&mut buffer);
+        buffer.truncate(buffer.len() - 1);
+
+        let mut bytes: &[u8] = &buffer;
+        assert!(Vector::decode(&mut bytes, DataType::Int64, 100, 3).is_err());
     }
 }
