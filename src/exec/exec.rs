@@ -2,14 +2,18 @@ use crate::catalog::DataType;
 
 pub const VECTOR_SIZE: usize = 2048;
 // Validity of a Vector: bit i = 1 means value i is present, 0 means NULL.
+#[derive(Debug, PartialEq)]
 pub struct Bitmap {
     pub words: Vec<u64>, // one bit per row, 64 rows per word: 2048 rows → 32 words, 65,536 → 1024
 }
 impl Bitmap {
+    // Words needed for `num_rows` bits. Shared by all_valid and the PAX decoder so they always agree.
+    pub fn num_words(num_rows: usize) -> usize {
+        (num_rows + 63) / 64 // round up: 100 rows still need 2 words
+    }
     pub fn all_valid(num_rows: usize) -> Self {
-        let num_words = (num_rows + 63) / 64; // round up: 100 rows still need 2 words
         Bitmap {
-            words: vec![u64::MAX; num_words],
+            words: vec![u64::MAX; Bitmap::num_words(num_rows)],
         } // every bit = 1 → no NULLs
     }
     pub fn is_valid(&self, i: usize) -> bool {

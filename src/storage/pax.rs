@@ -504,6 +504,17 @@ impl Bitmap {
             buffer.extend_from_slice(&word.to_le_bytes());
         }
     }
+
+    pub fn decode(buffer: &mut &[u8], num_rows: usize) -> Result<Self, String> {
+        let num_words = Bitmap::num_words(num_rows);
+        let bytes = take_bytes(buffer, 8 * num_words, "Unexpected end reading bitmap")?;
+
+        let mut words = Vec::with_capacity(num_words); // safe: take_bytes already proved the bytes exist
+        for piece in bytes.chunks_exact(8) {
+            words.push(u64::from_le_bytes(piece.try_into().unwrap()));
+        }
+        Ok(Bitmap { words })
+    }
 }
 // we want to pull the metadata, then stream chunks of Vectors at certain offsets
 fn read() {}
@@ -919,5 +930,47 @@ mod tests {
         buffer[8] = 0xFF; // first data byte, after offsets [0, 3]
         let mut bytes: &[u8] = &buffer;
         assert!(VectorData::decode(&mut bytes, DataType::Varchar, 1).is_err());
+    }
+
+    #[test]
+    fn decode_bitmap() {
+        // 100 rows -> 2 words. NULLs on both sides of the word boundary (63 | 64) and at the ends.
+        let mut bitmap = Bitmap::all_valid(100);
+        for i in [0, 63, 64, 99] {
+            bitmap.set_null(i);
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        bitmap.encode(&mut buffer);
+        buffer.extend_from_slice(&[7, 7, 7]); // pretend the values follow the bitmap
+        assert_eq!(buffer.len(), 2 * 8 + 3);
+
+        let mut bytes: &[u8] = &buffer;
+        let decoded = Bitmap::decode(&mut bytes, 100).unwrap();
+
+        assert_eq!(decoded, bitmap);
+        assert!(!decoded.is_valid(64));
+        assert!(decoded.is_valid(65));
+        assert_eq!(bytes, &[7, 7, 7]); // only the bitmap's bytes were taken
+    }
+
+    #[test]
+    fn decode_bitmap_too_few_bytes() {
+        let mut buffer: Vec<u8> = Vec::new();
+        Bitmap::all_valid(64).encode(&mut buffer); // 1 word
+
+        // 65 rows need 2 words
+        let mut bytes: &[u8] = &buffer;
+        assert!(Bitmap::decode(&mut bytes, 65).is_err());
+    }
+
+    #[test]
+    fn decode_bitmap_huge_num_rows() {
+        let mut buffer: Vec<u8> = Vec::new();
+        Bitmap::all_valid(64).encode(&mut buffer);
+
+        // A corrupted row count must fail cleanly, not reserve memory for it.
+        let mut bytes: &[u8] = &buffer;
+        assert!(Bitmap::decode(&mut bytes, u32::MAX as usize).is_err());
     }
 }
