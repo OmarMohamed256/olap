@@ -1,4 +1,7 @@
-use crate::catalog::{Column, DataType, TableSchema};
+use crate::{
+    catalog::{Column, DataType, TableSchema},
+    exec::exec::{Bitmap, VectorData},
+};
 impl Column {
     // A helper to make creating columns less verbose
     pub fn new(name: &str, ty: DataType) -> Self {
@@ -375,6 +378,133 @@ impl PaxFooter {
     }
 }
 
+// How execution types map to the file layout:
+//   row group      (all columns, up to 65,536 rows) -> split into 32 DataChunks when scanned
+//   column chunk   (one column of a row group)      -> one Vector: values + validity
+//   values section of a column chunk                -> VectorData
+//   validity section (only if null_count > 0)       -> Bitmap
+impl VectorData {
+    pub fn encode(&self, buffer: &mut Vec<u8>) {
+        match self {
+            VectorData::Int64(v) => {
+                buffer.reserve(v.len() * 8);
+                for &val in v {
+                    buffer.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            VectorData::Float64(v) => {
+                buffer.reserve(v.len() * 8);
+                for &val in v {
+                    buffer.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            VectorData::Date(v) => {
+                buffer.reserve(v.len() * 4);
+                for &val in v {
+                    buffer.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            VectorData::Varchar(v) => {
+                let total_bytes: usize = v.iter().map(|s| s.len()).sum();
+                buffer.reserve(4 + (v.len() * 4) + total_bytes);
+
+                let mut offset: u32 = 0;
+                buffer.extend_from_slice(&offset.to_le_bytes());
+
+                // Pass 2: Write all offsets sequentially
+                for s in v {
+                    offset += s.len() as u32;
+                    buffer.extend_from_slice(&offset.to_le_bytes());
+                }
+
+                // Pass 3: Write all string payloads sequentially
+                for s in v {
+                    buffer.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+    pub fn decode(buffer: &mut &[u8], ty: DataType, num_rows: usize) -> Result<Self, String> {
+        match ty {
+            DataType::Int64 => {
+                let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading i64 values")?;
+                let mut values = Vec::with_capacity(num_rows); // safe: take_bytes already proved the bytes exist
+                for piece in bytes.chunks_exact(8) {
+                    values.push(i64::from_le_bytes(piece.try_into().unwrap()));
+                }
+                Ok(VectorData::Int64(values))
+            }
+            DataType::Float64 => {
+                let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading f64 values")?;
+                let mut values = Vec::with_capacity(num_rows);
+                for piece in bytes.chunks_exact(8) {
+                    values.push(f64::from_le_bytes(piece.try_into().unwrap()));
+                }
+                Ok(VectorData::Float64(values))
+            }
+            DataType::Date => {
+                let bytes = take_bytes(buffer, 4 * num_rows, "Unexpected end reading date values")?;
+                let mut values = Vec::with_capacity(num_rows);
+                for piece in bytes.chunks_exact(4) {
+                    values.push(i32::from_le_bytes(piece.try_into().unwrap()));
+                }
+                Ok(VectorData::Date(values))
+            }
+            DataType::Varchar => {
+                // 1. Offsets: num_rows + 1 of them; string i is data[offsets[i]..offsets[i + 1]]
+                let offset_bytes = take_bytes(
+                    buffer,
+                    4 * (num_rows + 1),
+                    "Unexpected end reading string offsets",
+                )?;
+                let mut offsets: Vec<usize> = Vec::with_capacity(num_rows + 1);
+                for piece in offset_bytes.chunks_exact(4) {
+                    offsets.push(u32::from_le_bytes(piece.try_into().unwrap()) as usize);
+                }
+
+                // 2. Check offsets before slicing with them, so bad data returns Err instead of panicking
+                if offsets[0] != 0 {
+                    return Err(format!(
+                        "Corrupted data: first string offset must be 0, got {}",
+                        offsets[0]
+                    ));
+                }
+                for i in 0..num_rows {
+                    if offsets[i + 1] < offsets[i] {
+                        return Err(format!(
+                            "Corrupted data: string offset {} is smaller than the one before it",
+                            i + 1
+                        ));
+                    }
+                }
+
+                // 3. Data area: the last offset is its total length
+                let data_len = offsets[num_rows];
+                let data = take_bytes(buffer, data_len, "Unexpected end reading string data")?;
+
+                // 4. Cut each string out of the data area
+                let mut values = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    let value_bytes = &data[offsets[i]..offsets[i + 1]];
+                    let value = std::str::from_utf8(value_bytes)
+                        .map_err(|_| "Invalid UTF-8 in string value".to_string())?
+                        .to_string();
+                    values.push(value);
+                }
+
+                Ok(VectorData::Varchar(values))
+            }
+        }
+    }
+}
+impl Bitmap {
+    pub fn encode(&self, buffer: &mut Vec<u8>) {
+        buffer.reserve(self.words.len() * 8);
+        for &word in &self.words {
+            buffer.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+}
 // we want to pull the metadata, then stream chunks of Vectors at certain offsets
 fn read() {}
 
@@ -676,5 +806,118 @@ mod tests {
         let mut bytes: &[u8] = &buffer;
         // Must fail with "unexpected end", not try to allocate ~4 billion row groups.
         assert!(PaxFooter::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn decode_vectordata_fixed_width() {
+        let cases = vec![
+            (VectorData::Int64(vec![1, -2, i64::MAX]), DataType::Int64),
+            (
+                VectorData::Float64(vec![0.04, -1.5, 0.0]),
+                DataType::Float64,
+            ),
+            (VectorData::Date(vec![9568, 0, -1]), DataType::Date), // 1996-03-13, 1970-01-01, 1969-12-31
+        ];
+        for (values, ty) in cases {
+            let mut buffer: Vec<u8> = Vec::new();
+            values.encode(&mut buffer);
+
+            let mut bytes: &[u8] = &buffer;
+            let decoded = VectorData::decode(&mut bytes, ty, 3).unwrap();
+
+            assert_eq!(decoded, values);
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_vectordata_too_few_bytes() {
+        let mut buffer: Vec<u8> = Vec::new();
+        VectorData::Int64(vec![1, 2, 3]).encode(&mut buffer);
+
+        // 24 bytes hold 3 values; asking for 4 must fail, not read past the end.
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, 4).is_err());
+    }
+
+    #[test]
+    fn decode_vectordata_huge_num_rows() {
+        let mut buffer: Vec<u8> = Vec::new();
+        VectorData::Int64(vec![1, 2, 3]).encode(&mut buffer);
+
+        // A corrupted row count must fail cleanly, not try to reserve ~34 GB.
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, u32::MAX as usize).is_err());
+    }
+
+    fn varchar_bytes(values: &[&str]) -> Vec<u8> {
+        let strings: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        let mut buffer = Vec::new();
+        VectorData::Varchar(strings).encode(&mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn decode_vectordata_varchar() {
+        // "" is how a NULL slot looks; "café" has 4 chars but 5 bytes
+        let values = VectorData::Varchar(vec![
+            "AIR".to_string(),
+            "".to_string(),
+            "TRUCK".to_string(),
+            "café".to_string(),
+        ]);
+        let mut buffer: Vec<u8> = Vec::new();
+        values.encode(&mut buffer);
+        assert_eq!(buffer.len(), 5 * 4 + 13); // offsets [0, 3, 3, 8, 13] + 13 data bytes
+
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 4).unwrap();
+
+        assert_eq!(decoded, values);
+        assert!(bytes.is_empty()); // data area consumed too, not just offsets
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_zero_rows() {
+        let buffer = varchar_bytes(&[]); // just the single offset 0
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 0).unwrap();
+        assert_eq!(decoded, VectorData::Varchar(vec![]));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_truncated() {
+        let buffer = varchar_bytes(&["AIR", "TRUCK"]);
+        // Cutting anywhere before the end must fail, never panic.
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err(),
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_bad_offsets() {
+        // offsets [0, 3, 8] + "AIRTRUCK"
+        let mut first_not_zero = varchar_bytes(&["AIR", "TRUCK"]);
+        first_not_zero[0] = 1;
+        let mut bytes: &[u8] = &first_not_zero;
+        assert!(VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err());
+
+        let mut decreasing = varchar_bytes(&["AIR", "TRUCK"]);
+        decreasing[4] = 9; // offsets become [0, 9, 8]
+        let mut bytes: &[u8] = &decreasing;
+        assert!(VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err());
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_invalid_utf8() {
+        let mut buffer = varchar_bytes(&["AIR"]);
+        buffer[8] = 0xFF; // first data byte, after offsets [0, 3]
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Varchar, 1).is_err());
     }
 }

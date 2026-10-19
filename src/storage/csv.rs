@@ -79,7 +79,7 @@ impl TableSource for CsvTable {
     fn read(&self, column: usize, start: usize, count: usize) -> Vector {
         Vector {
             data: self.columns[column].slice(start, count),
-            validity: Bitmap::all_valid(),
+            validity: Bitmap::all_valid(count),
         }
     }
 }

@@ -1,14 +1,15 @@
 use crate::catalog::DataType;
 
 pub const VECTOR_SIZE: usize = 2048;
-// (one typed column of values plus a null bitmap)
+// Validity of a Vector: bit i = 1 means value i is present, 0 means NULL.
 pub struct Bitmap {
-    words: [u64; 32], // 32 × 64 = 2048 bits
+    pub words: Vec<u64>, // one bit per row, 64 rows per word: 2048 rows → 32 words, 65,536 → 1024
 }
 impl Bitmap {
-    pub fn all_valid() -> Self {
+    pub fn all_valid(num_rows: usize) -> Self {
+        let num_words = (num_rows + 63) / 64; // round up: 100 rows still need 2 words
         Bitmap {
-            words: [u64::MAX; 32],
+            words: vec![u64::MAX; num_words],
         } // every bit = 1 → no NULLs
     }
     pub fn is_valid(&self, i: usize) -> bool {
@@ -18,8 +19,11 @@ impl Bitmap {
         self.words[i / 64] &= !(1 << (i % 64));
     }
 }
+// The values of one column, without validity (that lives in Vector.validity).
+// NULL rows still take a slot so value i always belongs to row i.
+#[derive(Debug, PartialEq)]
 pub enum VectorData {
-    Int64(Vec<i64>), // 2048 × 8 bytes, packed
+    Int64(Vec<i64>), // 8 bytes per value, packed
     Float64(Vec<f64>),
     Date(Vec<i32>), // days since 1970-01-01
     Varchar(Vec<String>),
@@ -34,7 +38,6 @@ impl VectorData {
             DataType::Varchar => VectorData::Varchar(Vec::new()),
         }
     }
-
     pub fn len(&self) -> usize {
         match self {
             VectorData::Int64(v) => v.len(),
@@ -43,7 +46,6 @@ impl VectorData {
             VectorData::Varchar(v) => v.len(),
         }
     }
-
     /// Copies `count` values starting at `start` into a new VectorData.
     pub fn slice(&self, start: usize, count: usize) -> Self {
         let range = start..start + count;
@@ -54,7 +56,6 @@ impl VectorData {
             VectorData::Varchar(v) => VectorData::Varchar(v[range].to_vec()),
         }
     }
-
     pub fn format(&self, row: usize) -> String {
         match self {
             VectorData::Int64(v) => v[row].to_string(),
@@ -79,10 +80,14 @@ fn format_date(days: i32) -> String {
     let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
     format!("{y:04}-{m:02}-{d:02}")
 }
+// One column's values plus validity. In execution it holds up to VECTOR_SIZE (2048) rows;
+// in storage, one Vector of num_rows rows is what a PAX column chunk encodes (see storage/pax.rs).
 pub struct Vector {
-    pub data: VectorData, // up to 2048 values of one type
-    pub validity: Bitmap, // 2048 bits: which of those values are NULL
+    pub data: VectorData, // values of one type
+    pub validity: Bitmap, // one bit per value: which of those values are NULL
 }
+// A batch of rows across several columns, the unit operators pass to each other.
+// A PAX row group (65,536 rows) splits into 32 DataChunks.
 pub struct DataChunk {
     pub columns: Vec<Vector>, // one Vector per column, e.g. 16 for SELECT * FROM lineitem
     pub count: usize,         // how many rows are filled in (≤ 2048)
