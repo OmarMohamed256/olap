@@ -1,6 +1,6 @@
 use crate::{
     catalog::{Column, DataType, TableSchema},
-    exec::exec::{Bitmap, VectorData},
+    exec::exec::{Bitmap, Vector, VectorData},
 };
 impl Column {
     // A helper to make creating columns less verbose
@@ -514,6 +514,26 @@ impl Bitmap {
             words.push(u64::from_le_bytes(piece.try_into().unwrap()));
         }
         Ok(Bitmap { words })
+    }
+}
+// One column chunk on disk: [bitmap, only if null_count > 0][values].
+impl Vector {
+    // Writes the chunk and returns its null_count for ChunkMetadata.
+    // The count comes from the bitmap, so the footer can never disagree with the bytes.
+    pub fn encode(&self, buffer: &mut Vec<u8>) -> u32 {
+        self.data.encode(buffer);
+    }
+
+    // ty from the schema, num_rows from RowGroupMeta, null_count from ChunkMetadata.
+    // null_count == 0 means no bitmap on disk: build Bitmap::all_valid instead.
+    // The caller passes exactly this chunk's bytes and checks nothing is left over.
+    pub fn decode(
+        buffer: &mut &[u8],
+        ty: DataType,
+        num_rows: usize,
+        null_count: u32,
+    ) -> Result<Self, String> {
+        todo!()
     }
 }
 // we want to pull the metadata, then stream chunks of Vectors at certain offsets

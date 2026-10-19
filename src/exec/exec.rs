@@ -17,9 +17,40 @@ impl Bitmap {
         } // every bit = 1 → no NULLs
     }
     pub fn is_valid(&self, i: usize) -> bool {
+        // i / 64 --> i >> 6  (Shift right by 6 is identical to dividing by 2^6)
+        // i % 64 --> i & 63  (Masking with 0b111111 isolates the remainder of division by 64)
+        // Equivalent optimized hardware execution:
+        // (self.words[i >> 6] >> (i & 63)) & 1 == 1
         (self.words[i / 64] >> (i % 64)) & 1 == 1
     }
+    // NULLs among the first `num_rows` bits; padding bits past num_rows are ignored.
+    pub fn null_count(&self, num_rows: usize) -> usize {
+        let mut num_words = Bitmap::num_words(num_rows);
+        // More rows than bits is a caller bug: fail with a clear message, not an index error.
+        assert!(
+            num_words <= self.words.len(),
+            "null_count: {num_rows} rows but bitmap has only {} words",
+            self.words.len()
+        );
+        let mut total_valid = 0;
+
+        if num_rows & 63 > 0 {
+            num_words -= 1;
+            let mask: u64 = (1u64 << (num_rows & 63)) - 1;
+            total_valid += (self.words[num_words] & mask).count_ones();
+        }
+        for i in 0..num_words {
+            total_valid += self.words[i].count_ones();
+        }
+        num_rows - total_valid as usize
+    }
     pub fn set_null(&mut self, i: usize) {
+        // COMPILER TRANSLATION:
+        // i / 64 --> i >> 6
+        // i % 64 --> i & 63
+        //
+        // Equivalent optimized hardware execution:
+        // self.words[i >> 6] &= !(1 << (i & 63));
         self.words[i / 64] &= !(1 << (i % 64));
     }
 }
@@ -141,5 +172,47 @@ impl Operator for Scan {
 
         self.position += count;
         Some(DataChunk { columns, count })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_count_partial_word() {
+        let mut bitmap = Bitmap::all_valid(100); // 2 words, 28 padding bits stay 1
+        assert_eq!(bitmap.null_count(100), 0);
+        for i in [0, 63, 64, 99] {
+            bitmap.set_null(i);
+        }
+        assert_eq!(bitmap.null_count(100), 4);
+    }
+
+    #[test]
+    fn null_count_full_words() {
+        let mut bitmap = Bitmap::all_valid(128); // no partial word
+        bitmap.set_null(127);
+        assert_eq!(bitmap.null_count(128), 1);
+    }
+
+    #[test]
+    fn null_count_zero_rows() {
+        assert_eq!(Bitmap::all_valid(0).null_count(0), 0);
+    }
+
+    #[test]
+    fn null_count_ignores_cleared_padding() {
+        // Padding cleared to 0 must not be counted as NULLs.
+        let bitmap = Bitmap {
+            words: vec![u64::MAX, 0],
+        };
+        assert_eq!(bitmap.null_count(64), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "null_count")]
+    fn null_count_too_many_rows() {
+        Bitmap::all_valid(64).null_count(65);
     }
 }
