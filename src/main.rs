@@ -3,14 +3,17 @@ mod exec;
 mod storage;
 
 use std::collections::HashMap;
+use std::fs;
+use std::time::Instant;
 
 use sqlparser::ast::{LimitClause, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::Catalog;
-use crate::exec::exec::{Operator, Scan, VectorData};
-use crate::storage::csv::{CsvTable, load_csv};
+use crate::exec::exec::{Bitmap, Vector, VectorData};
+use crate::storage::csv::load_csv;
+use crate::storage::pax;
 
 const DATA_DIR: &str = "data/sf0.1";
 
@@ -41,18 +44,38 @@ fn main() {
     //     }
     //
 
+    // CSV -> PAX: load lineitem, write it with our own writer, compare sizes.
     let catalog = Catalog::tpch();
-    let lineitem = catalog.get("lineitem").unwrap();
+    let schema = catalog.get("lineitem").unwrap();
+    let csv_path = format!("{DATA_DIR}/lineitem.csv");
+    let pax_path = format!("{DATA_DIR}/lineitem.pax");
 
-    let source = CsvTable::load("data/sf0.1/lineitem.csv", lineitem);
-    let mut scan = Scan::new(Box::new(source), (0..16).collect());
+    let start = Instant::now();
+    // load_csv gives values only; CSV has no NULLs, so every bitmap is all-valid.
+    let columns: Vec<Vector> = load_csv(&csv_path, schema)
+        .into_iter()
+        .map(|data| {
+            let validity = Bitmap::all_valid(data.len());
+            Vector { data, validity }
+        })
+        .collect();
+    println!(
+        "load csv:  {:?} ({} rows)",
+        start.elapsed(),
+        columns[0].data.len()
+    );
 
-    let (mut chunks, mut rows) = (0, 0);
-    while let Some(chunk) = scan.next() {
-        chunks += 1;
-        rows += chunk.count;
+    let start = Instant::now();
+    if let Err(e) = pax::write(&pax_path, schema, &columns) {
+        println!("write failed: {e}");
+        return;
     }
-    println!("{chunks} chunks, {rows} rows"); // expect: 294 chunks, 600572 rows
+    println!("write pax: {:?}", start.elapsed());
+
+    for path in [csv_path, format!("{DATA_DIR}/lineitem.parquet"), pax_path] {
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        println!("{path}: {:.1} MB", bytes as f64 / 1e6);
+    }
 }
 
 /// Runs `SELECT * FROM <table> [LIMIT n]` and prints the result.

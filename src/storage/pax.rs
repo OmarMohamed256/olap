@@ -1,7 +1,13 @@
+const MAGIC: [u8; 4] = *b"PAX1";
+// Rows per row group: 32 DataChunks of 2048. A multiple of 64, so each group's bitmap starts on a word boundary.
+const ROW_GROUP_SIZE: usize = 65_536;
 use crate::{
     catalog::{Column, DataType, TableSchema},
     exec::exec::{Bitmap, Vector, VectorData},
 };
+use std::fs::{self, File};
+use std::io::Write; // brings write_all into scope
+
 impl Column {
     // A helper to make creating columns less verbose
     pub fn new(name: &str, ty: DataType) -> Self {
@@ -385,26 +391,37 @@ impl PaxFooter {
 //   validity section (only if null_count > 0)       -> Bitmap
 impl VectorData {
     pub fn encode(&self, buffer: &mut Vec<u8>) {
+        self.encode_range(0, self.len(), buffer);
+    }
+
+    // Encodes only rows start..start + num_rows, so the writer can write one row group
+    // of a whole-table column without copying it first. `&v[range]` is a view, not a copy.
+    pub fn encode_range(&self, start: usize, num_rows: usize, buffer: &mut Vec<u8>) {
+        let range = start..start + num_rows;
         match self {
             VectorData::Int64(v) => {
+                let v = &v[range];
                 buffer.reserve(v.len() * 8);
                 for &val in v {
                     buffer.extend_from_slice(&val.to_le_bytes());
                 }
             }
             VectorData::Float64(v) => {
+                let v = &v[range];
                 buffer.reserve(v.len() * 8);
                 for &val in v {
                     buffer.extend_from_slice(&val.to_le_bytes());
                 }
             }
             VectorData::Date(v) => {
+                let v = &v[range];
                 buffer.reserve(v.len() * 4);
                 for &val in v {
                     buffer.extend_from_slice(&val.to_le_bytes());
                 }
             }
             VectorData::Varchar(v) => {
+                let v = &v[range]; // borrows the Strings, no clone: offsets restart at 0 per chunk
                 let total_bytes: usize = v.iter().map(|s| s.len()).sum();
                 buffer.reserve(4 + (v.len() * 4) + total_bytes);
 
@@ -499,8 +516,20 @@ impl VectorData {
 }
 impl Bitmap {
     pub fn encode(&self, buffer: &mut Vec<u8>) {
-        buffer.reserve(self.words.len() * 8);
-        for &word in &self.words {
+        self.encode_range(0, self.words.len() * 64, buffer);
+    }
+
+    // Writes the words covering rows start..start + num_rows. `start` must be a multiple
+    // of 64 so the range is whole words; no bit shifting needed.
+    pub fn encode_range(&self, start: usize, num_rows: usize, buffer: &mut Vec<u8>) {
+        assert!(
+            start % 64 == 0,
+            "Bitmap::encode_range: start {start} is not a multiple of 64"
+        );
+        let first_word = start / 64;
+        let words = &self.words[first_word..first_word + Bitmap::num_words(num_rows)];
+        buffer.reserve(words.len() * 8);
+        for &word in words {
             buffer.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -521,28 +550,111 @@ impl Vector {
     // Writes the chunk and returns its null_count for ChunkMetadata.
     // The count comes from the bitmap, so the footer can never disagree with the bytes.
     pub fn encode(&self, buffer: &mut Vec<u8>) -> u32 {
+        self.encode_range(0, self.data.len(), buffer)
+    }
+
+    // Writes rows start..start + num_rows as one column chunk; the writer calls this once
+    // per row group and column. `start` must be a multiple of 64 (row-group starts are).
+    pub fn encode_range(&self, start: usize, num_rows: usize, buffer: &mut Vec<u8>) -> u32 {
         debug_assert_eq!(
             self.validity.words.len(),
             Bitmap::num_words(self.data.len())
         );
-        let null_count = self.validity.null_count(self.data.len());
+        let null_count = self.validity.null_count_range(start, num_rows);
         if null_count > 0 {
-            self.validity.encode(buffer);
+            self.validity.encode_range(start, num_rows, buffer);
         }
-        self.data.encode(buffer);
+        self.data.encode_range(start, num_rows, buffer);
         null_count as u32
     }
 
-    // ty from the schema, num_rows from RowGroupMeta, null_count from ChunkMetadata.
-    // null_count == 0 means no bitmap on disk: build Bitmap::all_valid instead.
-    // The caller passes exactly this chunk's bytes and checks nothing is left over.
+    // Min/max of the non-NULL rows in start..start + num_rows, for one column chunk's zone map.
+    // The caller must check null_count < num_rows first: an all-NULL chunk gets no zone map.
+    pub fn zone_map_range(&self, start: usize, num_rows: usize) -> ZoneMap {
+        let end = start + num_rows;
+        // The first non-NULL row seeds min and max, so no sentinels like i64::MAX are needed.
+        let mut first = start;
+        while first < end && !self.validity.is_valid(first) {
+            first += 1;
+        }
+        assert!(
+            first < end,
+            "zone_map_range: rows {start}..{end} are all NULL"
+        );
+
+        match &self.data {
+            VectorData::Int64(v) => {
+                let mut min = v[first];
+                let mut max = v[first];
+                for i in first + 1..end {
+                    if self.validity.is_valid(i) {
+                        min = min.min(v[i]);
+                        max = max.max(v[i]);
+                    }
+                }
+                ZoneMap {
+                    min: Scalar::I64(min),
+                    max: Scalar::I64(max),
+                }
+            }
+            VectorData::Float64(v) => {
+                // f64::min/max ignore NaN: min(NaN, 2.0) = 2.0. A chunk of only NaN gives NaN, NaN.
+                let mut min = v[first];
+                let mut max = v[first];
+                for i in first + 1..end {
+                    if self.validity.is_valid(i) {
+                        min = min.min(v[i]);
+                        max = max.max(v[i]);
+                    }
+                }
+                ZoneMap {
+                    min: Scalar::F64(min),
+                    max: Scalar::F64(max),
+                }
+            }
+            VectorData::Date(v) => {
+                let mut min = v[first];
+                let mut max = v[first];
+                for i in first + 1..end {
+                    if self.validity.is_valid(i) {
+                        min = min.min(v[i]);
+                        max = max.max(v[i]);
+                    }
+                }
+                ZoneMap {
+                    min: Scalar::Date(min),
+                    max: Scalar::Date(max),
+                }
+            }
+            VectorData::Varchar(v) => {
+                // Borrow while scanning and clone only the two winners, not every string.
+                // String comparison is byte-wise, which for UTF-8 equals code-point order.
+                let mut min = &v[first];
+                let mut max = &v[first];
+                for i in first + 1..end {
+                    if self.validity.is_valid(i) {
+                        if v[i] < *min {
+                            min = &v[i];
+                        }
+                        if v[i] > *max {
+                            max = &v[i];
+                        }
+                    }
+                }
+                ZoneMap {
+                    min: Scalar::String(min.clone()),
+                    max: Scalar::String(max.clone()),
+                }
+            }
+        }
+    }
+
     pub fn decode(
         buffer: &mut &[u8],
         ty: DataType,
         num_rows: usize,
         null_count: u32,
     ) -> Result<Self, String> {
-        // Same order as encode: [bitmap, only if null_count > 0][values].
         let validity = if null_count > 0 {
             let bitmap = Bitmap::decode(buffer, num_rows)?;
             // The footer and the chunk must agree; this also rejects null_count > num_rows.
@@ -557,9 +669,6 @@ impl Vector {
         Ok(Vector { data, validity })
     }
 }
-// we want to pull the metadata, then stream chunks of Vectors at certain offsets
-fn read() {}
-
 fn take_bytes<'a>(buffer: &mut &'a [u8], len: usize, err_msg: &str) -> Result<&'a [u8], String> {
     if buffer.len() < len {
         return Err(err_msg.to_string());
@@ -567,6 +676,95 @@ fn take_bytes<'a>(buffer: &mut &'a [u8], len: usize, err_msg: &str) -> Result<&'
     let (chunk, rest) = buffer.split_at(len);
     *buffer = rest;
     Ok(chunk)
+}
+
+pub fn write(path: &str, schema: &TableSchema, columns: &[Vector]) -> Result<(), String> {
+    // Validate everything before creating the file, so bad input never leaves a partial file.
+    if columns.is_empty() || columns.len() != schema.columns.len() {
+        return Err(format!(
+            "Schema has {} columns but {} were given",
+            schema.columns.len(),
+            columns.len()
+        ));
+    }
+    let total_rows = columns[0].data.len();
+    for i in 0..columns.len() {
+        let column = &columns[i];
+        let expected = &schema.columns[i];
+        if column.data.data_type() != expected.ty {
+            return Err(format!(
+                "Column {} is {:?} in the schema but the data is {:?}",
+                expected.name,
+                expected.ty,
+                column.data.data_type()
+            ));
+        }
+        if column.data.len() != total_rows {
+            return Err(format!(
+                "Column {} has {} rows, expected {}",
+                expected.name,
+                column.data.len(),
+                total_rows
+            ));
+        }
+        // null_count_range would panic on a short bitmap; reject it here instead.
+        if column.validity.words.len() != Bitmap::num_words(total_rows) {
+            return Err(format!(
+                "Column {} bitmap has {} words, expected {}",
+                expected.name,
+                column.validity.words.len(),
+                Bitmap::num_words(total_rows)
+            ));
+        }
+    }
+    //- Large writes: BufWriter, or one write_all per encoded row group. Not one syscall per value.
+    //- No half-written files: write to path.tmp, call sync_all(), then rename it to path.
+    //   A rename is atomic, so readers never see a file without its footer. This is cheap, and it fits the write-once design.
+    //- Honest benchmarks: a read benchmark straight after writing measures RAM, not disk. For cold-cache numbers,
+    // drop the page cache first (sync; echo 3 | sudo tee /proc/sys/vm/drop_caches), and say which kind of number you're reporting.
+    let mut buffer: Vec<u8> = MAGIC.to_vec();
+    let mut rg_metas: Vec<RowGroupMeta> =
+        Vec::with_capacity((total_rows + ROW_GROUP_SIZE - 1) / ROW_GROUP_SIZE);
+    for start_idx in (0..total_rows).step_by(ROW_GROUP_SIZE) {
+        let end_idx = std::cmp::min(start_idx + ROW_GROUP_SIZE, total_rows);
+        let current_batch_count = end_idx - start_idx;
+        let mut chunks_meta: Vec<ChunkMetadata> = Vec::with_capacity(columns.len()); // one per column
+        let len_before_write = buffer.len();
+        for column in columns {
+            let offset = buffer.len() as u64;
+            let null_count = column.encode_range(start_idx, current_batch_count, &mut buffer);
+            let chunk_length = (buffer.len() as u64 - offset) as u32;
+            let zone_map = if null_count != current_batch_count as u32 {
+                Some(column.zone_map_range(start_idx, current_batch_count))
+            } else {
+                None
+            };
+            chunks_meta.push(ChunkMetadata {
+                chunk_length,
+                offset,
+                null_count,
+                zone_map,
+            });
+        }
+        let rg_meta = RowGroupMeta {
+            chunks_metadata: chunks_meta,
+            num_rows: current_batch_count as u32,
+            total_byte_size: (buffer.len() - len_before_write) as u64,
+        };
+        rg_metas.push(rg_meta);
+    }
+    let footer = PaxFooter::new(schema.clone(), rg_metas);
+    let footer_start = buffer.len();
+    footer.encode(&mut buffer)?; // validates, then appends
+    let footer_len = (buffer.len() - footer_start) as u32; // measured, like chunk_length
+    buffer.extend_from_slice(&footer_len.to_le_bytes());
+    buffer.extend_from_slice(&MAGIC);
+    let tmp_path = format!("{path}.tmp");
+    let mut file = File::create(&tmp_path).map_err(|e| e.to_string())?;
+    file.write_all(&buffer).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1079,5 +1277,242 @@ mod tests {
 
         let mut bytes: &[u8] = &buffer;
         assert!(Vector::decode(&mut bytes, DataType::Int64, 100, 3).is_err());
+    }
+
+    // 150 rows of i64 with NULLs at 3, 70 and 149 (NULL slots hold 0).
+    fn int_vector_150() -> Vector {
+        let mut validity = Bitmap::all_valid(150);
+        for i in [3, 70, 149] {
+            validity.set_null(i);
+        }
+        let values: Vec<i64> = (0..150)
+            .map(|i| if validity.is_valid(i) { i as i64 } else { 0 })
+            .collect();
+        Vector {
+            data: VectorData::Int64(values),
+            validity,
+        }
+    }
+
+    // The same rows copied into their own Vector, the slow way the range encode avoids.
+    fn copy_rows(vector: &Vector, start: usize, num_rows: usize) -> Vector {
+        let mut validity = Bitmap::all_valid(num_rows);
+        for i in 0..num_rows {
+            if !vector.validity.is_valid(start + i) {
+                validity.set_null(i);
+            }
+        }
+        Vector {
+            data: vector.data.slice(start, num_rows),
+            validity,
+        }
+    }
+
+    #[test]
+    fn encode_range_matches_encoding_a_copy() {
+        let vector = int_vector_150();
+        // Rows 64..150: a word-aligned start and a partial last word, like a final row group.
+        let mut ranged: Vec<u8> = Vec::new();
+        let null_count = vector.encode_range(64, 86, &mut ranged);
+        assert_eq!(null_count, 2); // rows 70 and 149
+
+        let mut copied: Vec<u8> = Vec::new();
+        copy_rows(&vector, 64, 86).encode(&mut copied);
+        assert_eq!(ranged, copied);
+
+        let mut bytes: &[u8] = &ranged;
+        let decoded = Vector::decode(&mut bytes, DataType::Int64, 86, null_count).unwrap();
+        assert_eq!(decoded, copy_rows(&vector, 64, 86));
+    }
+
+    #[test]
+    fn encode_range_without_nulls_skips_bitmap() {
+        let vector = int_vector_150();
+        // Rows 0..64 hold only the NULL at row 3; rows 128..148 hold none.
+        let mut buffer: Vec<u8> = Vec::new();
+        assert_eq!(vector.encode_range(128, 20, &mut buffer), 0);
+        assert_eq!(buffer.len(), 20 * 8); // values only
+    }
+
+    #[test]
+    fn encode_range_varchar_offsets_restart() {
+        let names = ["a", "bb", "ccc", "dddd"].map(|s| s.to_string()).to_vec();
+        let mut strings = Vec::new();
+        for i in 0..70 {
+            strings.push(names[i % 4].clone());
+        }
+        let vector = Vector {
+            data: VectorData::Varchar(strings),
+            validity: Bitmap::all_valid(70),
+        };
+
+        let mut ranged: Vec<u8> = Vec::new();
+        vector.encode_range(64, 6, &mut ranged);
+        let mut copied: Vec<u8> = Vec::new();
+        copy_rows(&vector, 64, 6).encode(&mut copied);
+        assert_eq!(ranged, copied); // first offset is 0, not the bytes before row 64
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 64")]
+    fn encode_range_rejects_unaligned_start() {
+        int_vector_150().encode_range(10, 5, &mut Vec::new());
+    }
+
+    #[test]
+    fn zone_map_range_skips_nulls() {
+        // Rows 64..150 hold 64..148; the NULL at 149 holds 0, which must not become the min.
+        let zone_map = int_vector_150().zone_map_range(64, 86);
+        assert_eq!(
+            zone_map,
+            ZoneMap {
+                min: Scalar::I64(64),
+                max: Scalar::I64(148)
+            }
+        );
+    }
+
+    #[test]
+    fn zone_map_range_first_row_null() {
+        // Row 3 is NULL: the scan must start from the first non-NULL row, 4.
+        let zone_map = int_vector_150().zone_map_range(0, 64).min;
+        assert_eq!(zone_map, Scalar::I64(0));
+        let mut validity = Bitmap::all_valid(3);
+        validity.set_null(0);
+        let vector = Vector {
+            data: VectorData::Date(vec![-5, 10, 7]),
+            validity,
+        };
+        assert_eq!(
+            vector.zone_map_range(0, 3),
+            ZoneMap {
+                min: Scalar::Date(7),
+                max: Scalar::Date(10)
+            }
+        );
+    }
+
+    #[test]
+    fn zone_map_range_float_ignores_nan() {
+        let vector = Vector {
+            data: VectorData::Float64(vec![f64::NAN, 2.5, -1.0, f64::NAN]),
+            validity: Bitmap::all_valid(4),
+        };
+        assert_eq!(
+            vector.zone_map_range(0, 4),
+            ZoneMap {
+                min: Scalar::F64(-1.0),
+                max: Scalar::F64(2.5)
+            }
+        );
+    }
+
+    #[test]
+    fn zone_map_range_varchar() {
+        let vector = Vector {
+            data: VectorData::Varchar(["TRUCK", "AIR", "", "café"].map(|s| s.to_string()).to_vec()),
+            validity: Bitmap::all_valid(4),
+        };
+        let zone_map = vector.zone_map_range(0, 4);
+        assert_eq!(zone_map.min, Scalar::String("".to_string()));
+        assert_eq!(zone_map.max, Scalar::String("café".to_string())); // lowercase sorts after uppercase
+    }
+
+    #[test]
+    #[should_panic(expected = "all NULL")]
+    fn zone_map_range_all_null_panics() {
+        let mut validity = Bitmap::all_valid(2);
+        validity.set_null(0);
+        validity.set_null(1);
+        Vector {
+            data: VectorData::Int64(vec![0, 0]),
+            validity,
+        }
+        .zone_map_range(0, 2);
+    }
+
+    fn int_schema(names: &[&str]) -> TableSchema {
+        TableSchema::new(
+            "t",
+            names
+                .iter()
+                .map(|n| Column::new(n, DataType::Int64))
+                .collect(),
+        )
+    }
+
+    fn int_column(values: Vec<i64>) -> Vector {
+        let validity = Bitmap::all_valid(values.len());
+        Vector {
+            data: VectorData::Int64(values),
+            validity,
+        }
+    }
+
+    #[test]
+    fn write_rejects_wrong_column_count() {
+        let result = write(
+            "unused.pax",
+            &int_schema(&["a", "b"]),
+            &[int_column(vec![1])],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_rejects_wrong_type() {
+        let column = Vector {
+            data: VectorData::Date(vec![1]),
+            validity: Bitmap::all_valid(1),
+        };
+        assert!(write("unused.pax", &int_schema(&["a"]), &[column]).is_err());
+    }
+
+    #[test]
+    fn write_rejects_different_lengths() {
+        let columns = [int_column(vec![1, 2]), int_column(vec![1])];
+        assert!(write("unused.pax", &int_schema(&["a", "b"]), &columns).is_err());
+    }
+
+    #[test]
+    fn write_file_layout() {
+        let path = std::env::temp_dir().join("olap_write_file_layout.pax");
+        let path = path.to_str().unwrap();
+        // 70,000 rows: one full row group and one of 4,464 rows.
+        let columns = [int_column((0..70_000).collect())];
+        let schema = int_schema(&["a"]);
+        write(path, &schema, &columns).unwrap();
+
+        let file = std::fs::read(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(&file[..4], &MAGIC);
+        assert_eq!(&file[file.len() - 4..], &MAGIC);
+
+        // Tail: [footer][u32 footer length][magic]
+        let len_at = file.len() - 8;
+        let footer_len = u32::from_le_bytes(file[len_at..len_at + 4].try_into().unwrap()) as usize;
+        let mut footer_bytes: &[u8] = &file[len_at - footer_len..len_at];
+        let footer = PaxFooter::decode(&mut footer_bytes).unwrap();
+
+        assert_eq!(footer.scheme, schema);
+        let groups = &footer.row_groups_metadata;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].num_rows, 4_464);
+        let chunk = &groups[1].chunks_metadata[0];
+        assert_eq!(chunk.offset, 4 + 65_536 * 8); // right after group 0
+        assert_eq!(chunk.chunk_length, 4_464 * 8);
+        assert_eq!(
+            chunk.zone_map,
+            Some(ZoneMap {
+                min: Scalar::I64(65_536),
+                max: Scalar::I64(69_999)
+            })
+        );
+
+        // The chunk's bytes decode back to the original rows.
+        let start = chunk.offset as usize;
+        let mut bytes: &[u8] = &file[start..start + chunk.chunk_length as usize];
+        let decoded = Vector::decode(&mut bytes, DataType::Int64, 4_464, chunk.null_count).unwrap();
+        assert_eq!(decoded.data, VectorData::Int64((65_536..70_000).collect()));
     }
 }

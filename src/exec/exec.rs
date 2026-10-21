@@ -25,23 +25,34 @@ impl Bitmap {
     }
     // NULLs among the first `num_rows` bits; padding bits past num_rows are ignored.
     pub fn null_count(&self, num_rows: usize) -> usize {
+        self.null_count_range(0, num_rows)
+    }
+    // NULLs among rows start..start + num_rows. `start` must be a multiple of 64 so the
+    // range begins on a word boundary (row groups always do: 65,536 = 1024 × 64).
+    pub fn null_count_range(&self, start: usize, num_rows: usize) -> usize {
+        assert!(
+            start % 64 == 0,
+            "null_count_range: start {start} is not a multiple of 64"
+        );
+        let first_word = start / 64;
         let mut num_words = Bitmap::num_words(num_rows);
         // More rows than bits is a caller bug: fail with a clear message, not an index error.
         assert!(
-            num_words <= self.words.len(),
-            "null_count: {num_rows} rows but bitmap has only {} words",
+            first_word + num_words <= self.words.len(),
+            "null_count: {num_rows} rows from row {start} but bitmap has only {} words",
             self.words.len()
         );
+        let words = &self.words[first_word..first_word + num_words]; // just this range's words, no copy
         let mut total_valid = 0;
 
         // check if there is leftover rows
         if num_rows & 63 > 0 {
             num_words -= 1;
             let mask: u64 = (1u64 << (num_rows & 63)) - 1;
-            total_valid += (self.words[num_words] & mask).count_ones();
+            total_valid += (words[num_words] & mask).count_ones();
         }
         for i in 0..num_words {
-            total_valid += self.words[i].count_ones();
+            total_valid += words[i].count_ones();
         }
         num_rows - total_valid as usize
     }
@@ -72,6 +83,15 @@ impl VectorData {
             DataType::Float64 => VectorData::Float64(Vec::new()),
             DataType::Date => VectorData::Date(Vec::new()),
             DataType::Varchar => VectorData::Varchar(Vec::new()),
+        }
+    }
+    // The catalog type these values belong to; the reverse of `new`.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            VectorData::Int64(_) => DataType::Int64,
+            VectorData::Float64(_) => DataType::Float64,
+            VectorData::Date(_) => DataType::Date,
+            VectorData::Varchar(_) => DataType::Varchar,
         }
     }
     pub fn len(&self) -> usize {
