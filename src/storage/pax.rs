@@ -6,7 +6,7 @@ use crate::{
     exec::exec::{Bitmap, Vector, VectorData},
 };
 use std::fs::{self, File};
-use std::io::Write; // brings write_all into scope
+use std::io::{Read, Seek, SeekFrom, Write}; // traits that add read_exact, seek and write_all to File
 
 impl Column {
     // A helper to make creating columns less verbose
@@ -717,7 +717,6 @@ pub fn write(path: &str, schema: &TableSchema, columns: &[Vector]) -> Result<(),
             ));
         }
     }
-    //- Large writes: BufWriter, or one write_all per encoded row group. Not one syscall per value.
     //- No half-written files: write to path.tmp, call sync_all(), then rename it to path.
     //   A rename is atomic, so readers never see a file without its footer. This is cheap, and it fits the write-once design.
     //- Honest benchmarks: a read benchmark straight after writing measures RAM, not disk. For cold-cache numbers,
@@ -765,6 +764,63 @@ pub fn write(path: &str, schema: &TableSchema, columns: &[Vector]) -> Result<(),
     file.sync_all().map_err(|e| e.to_string())?;
     fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// An open PAX file: the file handle plus its decoded footer. Fields are private so
+// callers can't move the file cursor or swap the footer; read through the methods.
+pub struct PaxFile {
+    file: File,
+    footer: PaxFooter,
+}
+
+impl PaxFile {
+    pub fn open(path: &str) -> Result<PaxFile, String> {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        // Smallest possible file: leading magic (4) + footer length (4) + trailing magic (4).
+        if file_len < 12 {
+            return Err(format!(
+                "file is {file_len} bytes, too small for a PAX file"
+            ));
+        }
+
+        // Tail: [u32 footer length][MAGIC]
+        let mut tail = [0u8; 8];
+        file.seek(SeekFrom::End(-8)).map_err(|e| e.to_string())?;
+        file.read_exact(&mut tail).map_err(|e| e.to_string())?;
+
+        let mut start_magic = [0u8; 4];
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        file.read_exact(&mut start_magic)
+            .map_err(|e| e.to_string())?;
+
+        if tail[4..8] != MAGIC || start_magic != MAGIC {
+            return Err("file is corrupted".to_string());
+        }
+        let footer_len = u32::from_le_bytes(tail[0..4].try_into().unwrap());
+
+        if footer_len as u64 > file_len - 12 {
+            return Err(format!(
+                "footer length {footer_len} does not fit in a {file_len}-byte file"
+            ));
+        }
+
+        file.seek(SeekFrom::Start(file_len - 8 - (footer_len as u64)))
+            .map_err(|e| e.to_string())?;
+        let mut footer_buffer = vec![0u8; footer_len as usize];
+        file.read_exact(&mut footer_buffer)
+            .map_err(|e| e.to_string())?;
+        let mut slice: &[u8] = &footer_buffer;
+        let footer = PaxFooter::decode(&mut slice)?;
+        if !slice.is_empty() {
+            return Err("failure decoding the footer".to_string());
+        }
+        Ok(PaxFile { file, footer })
+    }
+
+    pub fn footer(&self) -> &PaxFooter {
+        &self.footer
+    }
 }
 
 #[cfg(test)]
@@ -1514,5 +1570,103 @@ mod tests {
         let mut bytes: &[u8] = &file[start..start + chunk.chunk_length as usize];
         let decoded = Vector::decode(&mut bytes, DataType::Int64, 4_464, chunk.null_count).unwrap();
         assert_eq!(decoded.data, VectorData::Int64((65_536..70_000).collect()));
+    }
+
+    // A unique path in the temp dir; tests run in parallel, so each needs its own file.
+    fn temp_path(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("olap_{name}.pax"));
+        path.to_str().unwrap().to_string()
+    }
+
+    // Bytes of a valid PAX file: one Int64 column "a" holding 0..100.
+    fn valid_file_bytes(name: &str) -> Vec<u8> {
+        let path = temp_path(name);
+        write(&path, &int_schema(&["a"]), &[int_column((0..100).collect())]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        bytes
+    }
+
+    // Saves `bytes` as a file, opens it, deletes it, and returns what open returned.
+    fn open_bytes(name: &str, bytes: &[u8]) -> Result<PaxFile, String> {
+        let path = temp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+        let result = PaxFile::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        result
+    }
+
+    #[test]
+    fn open_reads_footer() {
+        let path = temp_path("open_reads_footer");
+        let schema = int_schema(&["a", "b"]);
+        // 70,000 rows: two row groups
+        let columns = [
+            int_column((0..70_000).collect()),
+            int_column((0..70_000).rev().collect()),
+        ];
+        write(&path, &schema, &columns).unwrap();
+        let pax = PaxFile::open(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        let footer = pax.unwrap().footer;
+        assert_eq!(footer.scheme, schema);
+        assert_eq!(footer.row_groups_metadata.len(), 2);
+        assert_eq!(footer.row_groups_metadata[0].num_rows, 65_536);
+        assert_eq!(footer.row_groups_metadata[1].num_rows, 4_464);
+    }
+
+    #[test]
+    fn open_missing_file() {
+        assert!(PaxFile::open(&temp_path("open_missing_file")).is_err());
+    }
+
+    #[test]
+    fn open_rejects_too_small() {
+        // 11 bytes: one short of the smallest possible file
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&MAGIC);
+        assert!(open_bytes("open_rejects_too_small", &bytes).is_err());
+    }
+
+    #[test]
+    fn open_rejects_bad_start_magic() {
+        let mut bytes = valid_file_bytes("open_rejects_bad_start_magic_src");
+        bytes[0] = b'X';
+        assert!(open_bytes("open_rejects_bad_start_magic", &bytes).is_err());
+    }
+
+    #[test]
+    fn open_rejects_bad_end_magic() {
+        let mut bytes = valid_file_bytes("open_rejects_bad_end_magic_src");
+        let last = bytes.len() - 1;
+        bytes[last] = b'X';
+        assert!(open_bytes("open_rejects_bad_end_magic", &bytes).is_err());
+    }
+
+    #[test]
+    fn open_rejects_huge_footer_len() {
+        let mut bytes = valid_file_bytes("open_rejects_huge_footer_len_src");
+        let len_at = bytes.len() - 8;
+        bytes[len_at..len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Must fail cleanly, not underflow `file_len - 8 - footer_len`.
+        assert!(open_bytes("open_rejects_huge_footer_len", &bytes).is_err());
+    }
+
+    #[test]
+    fn open_rejects_wrong_footer_len() {
+        let bytes = valid_file_bytes("open_rejects_wrong_footer_len_src");
+        let len_at = bytes.len() - 8;
+        let footer_len = u32::from_le_bytes(bytes[len_at..len_at + 4].try_into().unwrap());
+        // One byte off either way: the footer is read from the wrong place.
+        for wrong in [footer_len - 1, footer_len + 1] {
+            let mut bad = bytes.clone();
+            bad[len_at..len_at + 4].copy_from_slice(&wrong.to_le_bytes());
+            assert!(
+                open_bytes("open_rejects_wrong_footer_len", &bad).is_err(),
+                "footer_len {wrong}"
+            );
+        }
     }
 }
