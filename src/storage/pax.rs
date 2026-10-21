@@ -7,6 +7,7 @@ use crate::{
 };
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write}; // traits that add read_exact, seek and write_all to File
+use std::os::unix::fs::FileExt; // adds read_exact_at: read at an offset without moving the cursor
 
 impl Column {
     // A helper to make creating columns less verbose
@@ -821,7 +822,56 @@ impl PaxFile {
     pub fn footer(&self) -> &PaxFooter {
         &self.footer
     }
+
+    pub fn read_chunk(&self, group: usize, column: usize) -> Result<Vector, String> {
+        // Every error names the chunk, so a failure in a 160-chunk scan says which one.
+        let context = |e: String| format!("reading row group {group} column {column}: {e}");
+
+        let rg_metadata = self
+            .footer
+            .row_groups_metadata
+            .get(group)
+            .ok_or_else(|| context("row group out of range".to_string()))?;
+        let chunk_metadata = rg_metadata
+            .chunks_metadata
+            .get(column)
+            .ok_or_else(|| context("column out of range".to_string()))?;
+        // The footer decoder keeps chunks_metadata and the schema the same length,
+        // so this index is in range once the one above is.
+        let ty = self.footer.scheme.columns[column].ty;
+
+        let mut chunk_buffer = vec![0u8; chunk_metadata.chunk_length as usize];
+        self.file
+            .read_exact_at(&mut chunk_buffer, chunk_metadata.offset)
+            .map_err(|e| context(e.to_string()))?;
+
+        let mut slice: &[u8] = &chunk_buffer;
+        let vector = Vector::decode(
+            &mut slice,
+            ty,
+            rg_metadata.num_rows as usize,
+            chunk_metadata.null_count,
+        )
+        .map_err(context)?;
+        // chunk_length and the data must agree: leftover bytes mean one of them is wrong.
+        if !slice.is_empty() {
+            return Err(context(format!(
+                "{} bytes left over after decoding",
+                slice.len()
+            )));
+        }
+        Ok(vector)
+    }
 }
+
+/*
+* Questions to answer as you design the APIs yourself:
+1. Scan and source: what does Scan keep between next() calls now that it holds a whole row group? Who slices it into 2048-row pieces, and does the bitmap get sliced too?
+2. Opening and reading: what work happens once, when the file is opened, and what happens on every chunk read? Which of those should be separate functions?
+3. Errors: where can a read fail, and how do you get that failure out through Operator::next, which only returns Option?
+4. Moving the file position: reading a chunk at an offset normally means seeking, which needs &mut self. Can you avoid it? (Hint: look at std::os::unix::fs::FileExt.)
+5. Zone maps: what does the pruning code need to see before it reads any data?
+*/
 
 #[cfg(test)]
 mod tests {
@@ -1581,7 +1631,12 @@ mod tests {
     // Bytes of a valid PAX file: one Int64 column "a" holding 0..100.
     fn valid_file_bytes(name: &str) -> Vec<u8> {
         let path = temp_path(name);
-        write(&path, &int_schema(&["a"]), &[int_column((0..100).collect())]).unwrap();
+        write(
+            &path,
+            &int_schema(&["a"]),
+            &[int_column((0..100).collect())],
+        )
+        .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         bytes
@@ -1668,5 +1723,88 @@ mod tests {
                 "footer_len {wrong}"
             );
         }
+    }
+
+    // Two columns over 70,000 rows (two row groups): Int64 with a NULL every 1,000 rows,
+    // and Varchar with no NULLs, so one chunk has a bitmap and the other doesn't.
+    fn mixed_columns() -> (TableSchema, Vec<Vector>) {
+        let mut validity = Bitmap::all_valid(70_000);
+        for i in (0..70_000).step_by(1_000) {
+            validity.set_null(i);
+        }
+        let ints = Vector {
+            data: VectorData::Int64(
+                (0..70_000)
+                    .map(|i| if i % 1_000 == 0 { 0 } else { i })
+                    .collect(),
+            ),
+            validity,
+        };
+        let strings = Vector {
+            data: VectorData::Varchar((0..70_000).map(|i| format!("s{i}")).collect()),
+            validity: Bitmap::all_valid(70_000),
+        };
+        let schema = TableSchema::new(
+            "mixed",
+            vec![
+                Column::new("n", DataType::Int64),
+                Column::new("s", DataType::Varchar),
+            ],
+        );
+        (schema, vec![ints, strings])
+    }
+
+    // Writes mixed_columns, opens the file, and deletes it. On Linux an open file
+    // stays readable after its name is deleted, so the PaxFile still works.
+    fn open_mixed(name: &str) -> (PaxFile, Vec<Vector>) {
+        let path = temp_path(name);
+        let (schema, columns) = mixed_columns();
+        write(&path, &schema, &columns).unwrap();
+        let pax = PaxFile::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        (pax.unwrap(), columns)
+    }
+
+    #[test]
+    fn read_chunk_round_trip() {
+        let (pax, columns) = open_mixed("read_chunk_round_trip");
+        // (group, first row, rows): the last group is the short one
+        for (group, start, num_rows) in [(0, 0, 65_536), (1, 65_536, 4_464)] {
+            for column in 0..2 {
+                let chunk = pax.read_chunk(group, column).unwrap();
+                assert_eq!(chunk.data.len(), num_rows);
+                assert_eq!(
+                    chunk,
+                    copy_rows(&columns[column], start, num_rows),
+                    "group {group} column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_chunk_out_of_range() {
+        let (pax, _) = open_mixed("read_chunk_out_of_range");
+        assert!(pax.read_chunk(2, 0).is_err()); // only groups 0 and 1
+        assert!(pax.read_chunk(0, 2).is_err()); // only columns 0 and 1
+    }
+
+    #[test]
+    fn read_chunk_corrupt_varchar() {
+        let path = temp_path("read_chunk_corrupt_varchar_src");
+        let (schema, columns) = mixed_columns();
+        write(&path, &schema, &columns).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let pax = PaxFile::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // No NULLs in "s", so its chunk starts straight with the offsets; the first must be 0.
+        let offset = pax.footer.row_groups_metadata[0].chunks_metadata[1].offset as usize;
+        bytes[offset] = 1;
+        let bad = open_bytes("read_chunk_corrupt_varchar", &bytes).unwrap();
+
+        let err = bad.read_chunk(0, 1).err().unwrap();
+        assert!(err.contains("row group 0 column 1"), "{err}");
+        assert!(bad.read_chunk(0, 0).is_ok()); // other chunks are untouched
     }
 }

@@ -16,6 +16,28 @@ impl Bitmap {
             words: vec![u64::MAX; Bitmap::num_words(num_rows)],
         } // every bit = 1 → no NULLs
     }
+    pub fn slice(&self, start: usize, count: usize) -> Bitmap {
+        assert!(
+            start % 64 == 0,
+            "slice: start {start} is not a multiple of 64"
+        );
+        let first_word = start / 64;
+        let num_words = Bitmap::num_words(count);
+        assert!(
+            first_word + num_words <= self.words.len(),
+            "slice: {count} rows from row {start} but bitmap has only {} words",
+            self.words.len()
+        );
+
+        let mut words = self.words[first_word..first_word + num_words].to_vec();
+        // Padding bits past `count` are set to 1, like all_valid, so equal bitmaps
+        // compare equal word for word and encode to the same bytes.
+        if count & 63 > 0 {
+            let mask: u64 = (1u64 << (count & 63)) - 1; // 1s on the real rows
+            words[num_words - 1] |= !mask;
+        }
+        Bitmap { words }
+    }
     pub fn is_valid(&self, i: usize) -> bool {
         // i / 64 --> i >> 6  (Shift right by 6 is identical to dividing by 2^6)
         // i % 64 --> i & 63  (Masking with 0b111111 isolates the remainder of division by 64)
@@ -143,6 +165,18 @@ pub struct Vector {
     pub data: VectorData, // values of one type
     pub validity: Bitmap, // one bit per value: which of those values are NULL
 }
+impl Vector {
+    // Copies rows start..start + count; start must be a multiple of 64 (Scan slices at multiples of 2048).
+    pub fn slice(&self, start: usize, count: usize) -> Vector {
+        // Bitmap first: its asserts are cheap and give clear messages before any values are copied.
+        let validity = self.validity.slice(start, count);
+        Vector {
+            data: self.data.slice(start, count),
+            validity,
+        }
+    }
+}
+
 // A batch of rows across several columns, the unit operators pass to each other.
 // A PAX row group (65,536 rows) splits into 32 DataChunks.
 pub struct DataChunk {
@@ -236,5 +270,104 @@ mod tests {
     #[should_panic(expected = "null_count")]
     fn null_count_too_many_rows() {
         Bitmap::all_valid(64).null_count(65);
+    }
+
+    // 200 rows with NULLs on both sides of word boundaries and past row 100.
+    fn bitmap_200() -> Bitmap {
+        let mut bitmap = Bitmap::all_valid(200);
+        for i in [5, 63, 64, 100, 127, 128, 199] {
+            bitmap.set_null(i);
+        }
+        bitmap
+    }
+
+    #[test]
+    fn slice_matches_source_rows() {
+        let source = bitmap_200();
+        let slice = source.slice(64, 136); // rows 64..200
+        for i in 0..136 {
+            assert_eq!(slice.is_valid(i), source.is_valid(64 + i), "row {i}");
+        }
+        assert_eq!(slice.null_count(136), 5); // 64, 100, 127, 128, 199
+    }
+
+    #[test]
+    fn slice_padding_is_one() {
+        // Rows 0..100 end mid-word; the source has a NULL at row 100, right past the end.
+        let slice = bitmap_200().slice(0, 100);
+        let mut expected = Bitmap::all_valid(100);
+        for i in [5, 63, 64] {
+            expected.set_null(i);
+        }
+        assert_eq!(slice, expected);
+    }
+
+    #[test]
+    fn slice_full_words() {
+        let slice = bitmap_200().slice(128, 64); // exactly word 2, no padding to fix
+        assert_eq!(slice.words, vec![bitmap_200().words[2]]);
+    }
+
+    #[test]
+    fn slice_zero_rows() {
+        assert!(bitmap_200().slice(64, 0).words.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 64")]
+    fn slice_rejects_unaligned_start() {
+        bitmap_200().slice(10, 20);
+    }
+
+    // A Vector of `data` with NULLs at `nulls` (NULL slots keep whatever value they had).
+    fn vector(data: VectorData, nulls: &[usize]) -> Vector {
+        let mut validity = Bitmap::all_valid(data.len());
+        for &i in nulls {
+            validity.set_null(i);
+        }
+        Vector { data, validity }
+    }
+
+    #[test]
+    fn vector_slice_int() {
+        let source = vector(VectorData::Int64((0..200).collect()), &[5, 70, 100, 150]);
+        // Rows 64..100: NULL at 70 lands at 6; the NULL at 100 is just past the end.
+        let expected = vector(VectorData::Int64((64..100).collect()), &[6]);
+        assert_eq!(source.slice(64, 36), expected);
+    }
+
+    #[test]
+    fn vector_slice_varchar() {
+        let strings: Vec<String> = (0..130).map(|i| format!("s{i}")).collect();
+        let source = vector(VectorData::Varchar(strings), &[64, 66, 129]);
+        let expected_strings = (64..130).map(|i| format!("s{i}")).collect();
+        // Values and NULLs stay together: NULLs at 64, 66, 129 land at 0, 2, 65.
+        let expected = vector(VectorData::Varchar(expected_strings), &[0, 2, 65]);
+        assert_eq!(source.slice(64, 66), expected);
+    }
+
+    #[test]
+    fn vector_slice_last_short_slice() {
+        // A 4,464-row row group cut into 2048-row DataChunks: 2048, 2048, then 368.
+        let source = vector(VectorData::Int64((0..4_464).collect()), &[4_096, 4_463]);
+        let last = source.slice(4_096, 368);
+        assert_eq!(
+            last,
+            vector(VectorData::Int64((4_096..4_464).collect()), &[0, 367])
+        );
+        assert_eq!(last.validity.null_count(368), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 64")]
+    fn vector_slice_rejects_unaligned_start() {
+        let strings = (0..100).map(|i| format!("s{i}")).collect();
+        vector(VectorData::Varchar(strings), &[]).slice(10, 20);
+    }
+
+    #[test]
+    #[should_panic(expected = "slice")]
+    fn slice_too_many_rows() {
+        bitmap_200().slice(128, 129); // 3 words from word 2, but only 4 words exist
     }
 }
