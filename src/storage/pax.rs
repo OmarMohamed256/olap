@@ -3,7 +3,7 @@ const MAGIC: [u8; 4] = *b"PAX1";
 const ROW_GROUP_SIZE: usize = 65_536;
 use crate::{
     catalog::{Column, DataType, TableSchema},
-    exec::exec::{Bitmap, Vector, VectorData},
+    exec::exec::{Bitmap, StringVector, TableSource, Vector, VectorData},
 };
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write}; // traits that add read_exact, seek and write_all to File
@@ -422,23 +422,15 @@ impl VectorData {
                 }
             }
             VectorData::Varchar(v) => {
-                let v = &v[range]; // borrows the Strings, no clone: offsets restart at 0 per chunk
-                let total_bytes: usize = v.iter().map(|s| s.len()).sum();
-                buffer.reserve(4 + (v.len() * 4) + total_bytes);
-
-                let mut offset: u32 = 0;
-                buffer.extend_from_slice(&offset.to_le_bytes());
-
-                // Pass 2: Write all offsets sequentially
-                for s in v {
-                    offset += s.len() as u32;
-                    buffer.extend_from_slice(&offset.to_le_bytes());
+                let offsets = v.offsets();
+                let first = offsets[start];
+                let last = offsets[start + num_rows];
+                buffer.reserve(((num_rows + 1) * 4) + ((last - first) as usize));
+                for &o in &offsets[start..=start + num_rows] {
+                    buffer.extend_from_slice(&(o - first).to_le_bytes());
                 }
-
-                // Pass 3: Write all string payloads sequentially
-                for s in v {
-                    buffer.extend_from_slice(s.as_bytes());
-                }
+                let data = &v.data()[first as usize..last as usize];
+                buffer.extend_from_slice(data.as_bytes())
             }
         }
     }
@@ -475,42 +467,31 @@ impl VectorData {
                     4 * (num_rows + 1),
                     "Unexpected end reading string offsets",
                 )?;
-                let mut offsets: Vec<usize> = Vec::with_capacity(num_rows + 1);
+                // ALLOC: one 256 KB Vec<u32> per chunk (same size as on disk); it moves into the
+                // StringVector, no conversion and no per-row allocation.
+                let mut offsets: Vec<u32> = Vec::with_capacity(num_rows + 1);
                 for piece in offset_bytes.chunks_exact(4) {
-                    offsets.push(u32::from_le_bytes(piece.try_into().unwrap()) as usize);
+                    offsets.push(u32::from_le_bytes(piece.try_into().unwrap()));
                 }
 
-                // 2. Check offsets before slicing with them, so bad data returns Err instead of panicking
-                if offsets[0] != 0 {
-                    return Err(format!(
-                        "Corrupted data: first string offset must be 0, got {}",
-                        offsets[0]
-                    ));
-                }
-                for i in 0..num_rows {
-                    if offsets[i + 1] < offsets[i] {
-                        return Err(format!(
-                            "Corrupted data: string offset {} is smaller than the one before it",
-                            i + 1
-                        ));
-                    }
-                }
-
-                // 3. Data area: the last offset is its total length
+                // 2. Data area: the last offset is its total length. Not checked yet: a huge value
+                // makes take_bytes fail, a wrong small one is caught by from_parts below.
                 let data_len = offsets[num_rows];
-                let data = take_bytes(buffer, data_len, "Unexpected end reading string data")?;
+                let data = take_bytes(
+                    buffer,
+                    data_len as usize,
+                    "Unexpected end reading string data",
+                )?;
 
-                // 4. Cut each string out of the data area
-                let mut values = Vec::with_capacity(num_rows);
-                for i in 0..num_rows {
-                    let value_bytes = &data[offsets[i]..offsets[i + 1]];
-                    let value = std::str::from_utf8(value_bytes)
-                        .map_err(|_| "Invalid UTF-8 in string value".to_string())?
-                        .to_string();
-                    values.push(value);
-                }
+                // 3. Check UTF-8 once for the whole data area, then copy it into one String.
+                // ALLOC: one String of data_len bytes per chunk, instead of one per row.
+                let text = std::str::from_utf8(data)
+                    .map_err(|_| "Invalid UTF-8 in string value".to_string())?
+                    .to_string();
 
-                Ok(VectorData::Varchar(values))
+                // 4. from_parts checks the offsets (start at 0, never decrease, end at data_len,
+                // on character boundaries) and returns Err on corrupt data instead of panicking.
+                Ok(VectorData::Varchar(StringVector::from_parts(offsets, text)?))
             }
         }
     }
@@ -630,21 +611,21 @@ impl Vector {
             VectorData::Varchar(v) => {
                 // Borrow while scanning and clone only the two winners, not every string.
                 // String comparison is byte-wise, which for UTF-8 equals code-point order.
-                let mut min = &v[first];
-                let mut max = &v[first];
+                let mut min = v.get(first);
+                let mut max = v.get(first);
                 for i in first + 1..end {
                     if self.validity.is_valid(i) {
-                        if v[i] < *min {
-                            min = &v[i];
+                        if v.get(i) < min {
+                            min = v.get(i);
                         }
-                        if v[i] > *max {
-                            max = &v[i];
+                        if v.get(i) > max {
+                            max = v.get(i);
                         }
                     }
                 }
                 ZoneMap {
-                    min: Scalar::String(min.clone()),
-                    max: Scalar::String(max.clone()),
+                    min: Scalar::String(min.to_string()),
+                    max: Scalar::String(max.to_string()),
                 }
             }
         }
@@ -664,7 +645,7 @@ impl Vector {
             }
             bitmap
         } else {
-            Bitmap::all_valid(num_rows)
+            Bitmap::all_valid(num_rows) // ALLOC: 8 KB per chunk, filled with 1s; small
         };
         let data = VectorData::decode(buffer, ty, num_rows)?;
         Ok(Vector { data, validity })
@@ -823,6 +804,17 @@ impl PaxFile {
         &self.footer
     }
 
+    // Bytes on disk of the given columns over all row groups: what a scan of them reads.
+    pub fn columns_bytes(&self, columns: &[usize]) -> u64 {
+        let mut total = 0;
+        for group in &self.footer.row_groups_metadata {
+            for &column in columns {
+                total += group.chunks_metadata[column].chunk_length as u64;
+            }
+        }
+        total
+    }
+
     pub fn read_chunk(&self, group: usize, column: usize) -> Result<Vector, String> {
         // Every error names the chunk, so a failure in a 160-chunk scan says which one.
         let context = |e: String| format!("reading row group {group} column {column}: {e}");
@@ -840,6 +832,10 @@ impl PaxFile {
         // so this index is in range once the one above is.
         let ty = self.footer.scheme.columns[column].ty;
 
+        // ALLOC: one buffer per chunk (~0.3–1 MB), zeroed and then overwritten right away by the read,
+        // freed at the end of this function. Large, so glibc uses mmap/munmap: page faults on every
+        // scan (with the decoded Vecs: ~840 per run of 7,10,11,12, ~39% of its time in the kernel).
+        // Reusing one buffer avoids it.
         let mut chunk_buffer = vec![0u8; chunk_metadata.chunk_length as usize];
         self.file
             .read_exact_at(&mut chunk_buffer, chunk_metadata.offset)
@@ -864,14 +860,34 @@ impl PaxFile {
     }
 }
 
-/*
-* Questions to answer as you design the APIs yourself:
-1. Scan and source: what does Scan keep between next() calls now that it holds a whole row group? Who slices it into 2048-row pieces, and does the bitmap get sliced too?
-2. Opening and reading: what work happens once, when the file is opened, and what happens on every chunk read? Which of those should be separate functions?
-3. Errors: where can a read fail, and how do you get that failure out through Operator::next, which only returns Option?
-4. Moving the file position: reading a chunk at an offset normally means seeking, which needs &mut self. Can you avoid it? (Hint: look at std::os::unix::fs::FileExt.)
-5. Zone maps: what does the pruning code need to see before it reads any data?
-*/
+// Lets Scan read a PAX file. Everything except read_row_group comes from the footer, already in memory.
+impl TableSource for PaxFile {
+    // How many row groups the footer lists.
+    fn num_row_groups(&self) -> usize {
+        self.footer.row_groups_metadata.len()
+    }
+
+    // Rows in group `group`, from the footer (u32 on disk, usize in memory).
+    // An out-of-range group is a caller bug, so indexing may panic.
+    fn row_group_num_rows(&self, group: usize) -> usize {
+        self.footer.row_groups_metadata[group].num_rows as usize
+    }
+
+    // One read_chunk per requested column, in the order asked; columns not listed are never read.
+    // read_chunk already checks the indexes and adds context to errors.
+    fn read_row_group(&self, group: usize, columns: &[usize]) -> Result<Vec<Vector>, String> {
+        let group_num = self.num_row_groups();
+        if group >= group_num {
+            return Err(format!(
+                "row group {group} out of range: file has {group_num}"
+            ));
+        }
+        columns
+            .iter()
+            .map(|&column| self.read_chunk(group, column))
+            .collect()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1207,21 +1223,15 @@ mod tests {
     }
 
     fn varchar_bytes(values: &[&str]) -> Vec<u8> {
-        let strings: Vec<String> = values.iter().map(|s| s.to_string()).collect();
         let mut buffer = Vec::new();
-        VectorData::Varchar(strings).encode(&mut buffer);
+        VectorData::Varchar(StringVector::from_strs(values)).encode(&mut buffer);
         buffer
     }
 
     #[test]
     fn decode_vectordata_varchar() {
         // "" is how a NULL slot looks; "café" has 4 chars but 5 bytes
-        let values = VectorData::Varchar(vec![
-            "AIR".to_string(),
-            "".to_string(),
-            "TRUCK".to_string(),
-            "café".to_string(),
-        ]);
+        let values = VectorData::Varchar(StringVector::from_strs(&["AIR", "", "TRUCK", "café"]));
         let mut buffer: Vec<u8> = Vec::new();
         values.encode(&mut buffer);
         assert_eq!(buffer.len(), 5 * 4 + 13); // offsets [0, 3, 3, 8, 13] + 13 data bytes
@@ -1234,11 +1244,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_vectordata_varchar_reencodes_same_bytes() {
+        // decode keeps the on-disk layout as is, so encoding the result gives back the same bytes.
+        let buffer = varchar_bytes(&["AIR", "", "TRUCK", "café"]);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 4).unwrap();
+        let mut reencoded = Vec::new();
+        decoded.encode(&mut reencoded);
+        assert_eq!(reencoded, buffer);
+    }
+
+    #[test]
     fn decode_vectordata_varchar_zero_rows() {
         let buffer = varchar_bytes(&[]); // just the single offset 0
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 0).unwrap();
-        assert_eq!(decoded, VectorData::Varchar(vec![]));
+        assert_eq!(decoded, VectorData::Varchar(StringVector::new()));
         assert!(bytes.is_empty());
     }
 
@@ -1267,6 +1288,17 @@ mod tests {
         decreasing[4] = 9; // offsets become [0, 9, 8]
         let mut bytes: &[u8] = &decreasing;
         assert!(VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err());
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_offset_inside_character() {
+        // offsets [0, 2, 2] + "é" (2 bytes: 0xC3 0xA9). The data stays valid UTF-8,
+        // but moving offset 1 to byte 1 cuts "é" in half: only the boundary check can catch it.
+        let mut buffer = varchar_bytes(&["é", ""]);
+        buffer[4] = 1; // offsets become [0, 1, 2]
+        let mut bytes: &[u8] = &buffer;
+        let err = VectorData::decode(&mut bytes, DataType::Varchar, 2).unwrap_err();
+        assert!(err.contains("character boundary"), "{err}");
     }
 
     #[test]
@@ -1351,7 +1383,7 @@ mod tests {
     #[test]
     fn vector_round_trip_no_nulls() {
         let vector = Vector {
-            data: VectorData::Varchar(vec!["AIR".to_string(), "".to_string(), "café".to_string()]),
+            data: VectorData::Varchar(StringVector::from_strs(&["AIR", "", "café"])),
             validity: Bitmap::all_valid(3),
         };
         let mut buffer: Vec<u8> = Vec::new();
@@ -1409,7 +1441,7 @@ mod tests {
             }
         }
         Vector {
-            data: vector.data.slice(start, num_rows),
+            data: vector.data.clone().take_range(start, num_rows),
             validity,
         }
     }
@@ -1442,10 +1474,10 @@ mod tests {
 
     #[test]
     fn encode_range_varchar_offsets_restart() {
-        let names = ["a", "bb", "ccc", "dddd"].map(|s| s.to_string()).to_vec();
-        let mut strings = Vec::new();
+        let names = ["a", "bb", "ccc", "dddd"];
+        let mut strings = StringVector::new();
         for i in 0..70 {
-            strings.push(names[i % 4].clone());
+            strings.push(names[i % 4]);
         }
         let vector = Vector {
             data: VectorData::Varchar(strings),
@@ -1516,7 +1548,7 @@ mod tests {
     #[test]
     fn zone_map_range_varchar() {
         let vector = Vector {
-            data: VectorData::Varchar(["TRUCK", "AIR", "", "café"].map(|s| s.to_string()).to_vec()),
+            data: VectorData::Varchar(StringVector::from_strs(&["TRUCK", "AIR", "", "café"])),
             validity: Bitmap::all_valid(4),
         };
         let zone_map = vector.zone_map_range(0, 4);

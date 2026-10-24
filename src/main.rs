@@ -1,3 +1,4 @@
+mod bench;
 mod catalog;
 mod exec;
 mod storage;
@@ -11,9 +12,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::Catalog;
-use crate::exec::exec::{Bitmap, Vector, VectorData};
-use crate::storage::csv::load_csv;
-use crate::storage::pax;
+use crate::exec::exec::{Bitmap, Operator, Scan, TableSource, Vector, VectorData};
+use crate::storage::csv::{CsvTable, load_csv};
+use crate::storage::pax::{self, PaxFile};
 
 const DATA_DIR: &str = "data/sf0.1";
 
@@ -50,6 +51,16 @@ fn main() {
     let csv_path = format!("{DATA_DIR}/lineitem.csv");
     let pax_path = format!("{DATA_DIR}/lineitem.pax");
 
+    // `olap pax 8,9 [runs]`: only scan those columns of the existing PAX file, so perf
+    // measures one workload instead of the whole program (see docs/profiling.md).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "pax" {
+        if let Err(e) = pax_only(&pax_path, schema.columns.len(), &args[2], args.get(3)) {
+            println!("error: {e}");
+        }
+        return;
+    }
+
     let start = Instant::now();
     // load_csv gives values only; CSV has no NULLs, so every bitmap is all-valid.
     let columns: Vec<Vector> = load_csv(&csv_path, schema)
@@ -72,10 +83,96 @@ fn main() {
     }
     println!("write pax: {:?}", start.elapsed());
 
-    for path in [csv_path, format!("{DATA_DIR}/lineitem.parquet"), pax_path] {
-        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let parquet_path = format!("{DATA_DIR}/lineitem.parquet");
+    for path in [&csv_path, &parquet_path, &pax_path] {
+        let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         println!("{path}: {:.1} MB", bytes as f64 / 1e6);
     }
+
+    // Scan the same columns from CSV and PAX. Equal checksums mean the PAX reader returns
+    // the same data; the times compare querying each file from disk.
+    // CSV has to be parsed on every query, so its time includes load_csv; PAX includes open.
+    let rows = columns[0].data.len();
+    let csv_bytes = fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
+    let pax_file = PaxFile::open(&pax_path).unwrap();
+    let q6 = vec![4, 5, 6, 10]; // l_quantity, l_extendedprice, l_discount, l_shipdate
+    let all: Vec<usize> = (0..schema.columns.len()).collect();
+
+    for (label, scan_columns) in [
+        ("Q6 columns", &q6),
+        ("fixed only", &vec![7, 10, 11, 12]),
+        ("varchar only", &vec![8, 9, 13]),
+        ("all columns", &all),
+    ] {
+        // Where l_quantity (column 4) sits in the chunk, for the checksum; None if not scanned.
+        let sum_at = scan_columns.iter().position(|&c| c == 4);
+        let pax_bytes = pax_file.columns_bytes(scan_columns);
+
+        let csv = bench::measure(&format!("csv {label}"), 3, rows, csv_bytes, || {
+            let source = CsvTable::load(&csv_path, schema);
+            drain(Scan::new(Box::new(source), scan_columns.clone()), sum_at).unwrap()
+        });
+        let pax = bench::measure(&format!("pax {label}"), 10, rows, pax_bytes, || {
+            let source = PaxFile::open(&pax_path).unwrap();
+            drain(Scan::new(Box::new(source), scan_columns.clone()), sum_at).unwrap()
+        });
+        println!(
+            "  checksums csv {csv:?}, pax {pax:?}, match: {}",
+            csv == pax
+        );
+    }
+}
+
+// Scans `columns` (e.g. "8,9") of the PAX file `runs` times (default 20) and prints the timing.
+// Run `olap` without arguments first, so the PAX file exists.
+fn pax_only(
+    path: &str,
+    num_columns: usize,
+    columns: &str,
+    runs: Option<&String>,
+) -> Result<(), String> {
+    let columns: Vec<usize> = columns
+        .split(',')
+        .map(|c| c.trim().parse().map_err(|_| format!("bad column: {c}")))
+        .collect::<Result<_, _>>()?;
+    let runs: usize = match runs {
+        Some(r) => r.parse().map_err(|_| format!("bad runs: {r}"))?,
+        None => 20,
+    };
+    if let Some(c) = columns.iter().find(|&&c| c >= num_columns) {
+        return Err(format!("column {c} out of range: the table has {num_columns}"));
+    }
+
+    let file = PaxFile::open(path)?;
+    let rows = (0..file.num_row_groups()).map(|g| file.row_group_num_rows(g)).sum();
+    let bytes = file.columns_bytes(&columns);
+    let sum_at = columns.iter().position(|&c| c == 4);
+
+    let result = bench::measure(&format!("pax {columns:?}"), runs, rows, bytes, || {
+        let source = PaxFile::open(path).unwrap();
+        drain(Scan::new(Box::new(source), columns.clone()), sum_at).unwrap()
+    });
+    println!("  checksum {result:?}, {:.1} MB scanned per run", bytes as f64 / 1e6);
+    Ok(())
+}
+
+// Pulls every chunk out of a Scan. Returns (rows, sum of the Float64 column at `sum_at`)
+// as a checksum: it checks the data and stops the compiler from skipping the scan.
+// With sum_at = None the checksum is only the row count.
+fn drain(mut scan: Scan, sum_at: Option<usize>) -> Result<(usize, f64), String> {
+    let mut rows = 0;
+    let mut sum = 0.0;
+    // FREE: each chunk is dropped at the end of the loop body: its Vecs (Varchar: two buffers
+    // per column, offsets and bytes).
+    while let Some(chunk) = scan.next()? {
+        rows += chunk.count;
+        if let Some(i) = sum_at {
+            if let VectorData::Float64(values) = &chunk.columns[i].data {
+                sum += values.iter().sum::<f64>();
+            }
+        }
+    }
+    Ok((rows, sum))
 }
 
 /// Runs `SELECT * FROM <table> [LIMIT n]` and prints the result.

@@ -29,6 +29,7 @@ impl Bitmap {
             self.words.len()
         );
 
+        // ALLOC: 32 words = 256 B per column per DataChunk; small
         let mut words = self.words[first_word..first_word + num_words].to_vec();
         // Padding bits past `count` are set to 1, like all_valid, so equal bitmaps
         // compare equal word for word and encode to the same bytes.
@@ -90,12 +91,119 @@ impl Bitmap {
 }
 // The values of one column, without validity (that lives in Vector.validity).
 // NULL rows still take a slot so value i always belongs to row i.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum VectorData {
     Int64(Vec<i64>), // 8 bytes per value, packed
     Float64(Vec<f64>),
     Date(Vec<i32>), // days since 1970-01-01
-    Varchar(Vec<String>),
+    Varchar(StringVector),
+}
+// mimic on disk strings
+#[derive(Debug, PartialEq, Clone)]
+pub struct StringVector {
+    offsets: Vec<u32>, // n + 1 entries; value i = data[offsets[i]..offsets[i + 1]]
+    data: String,      // all values back to back
+}
+impl StringVector {
+    pub fn new() -> Self {
+        StringVector {
+            offsets: vec![0],
+            data: String::new(),
+        }
+    }
+    pub fn push(&mut self, value: &str) {
+        self.data.push_str(value);
+        let offset = u32::try_from(self.data.len()).expect("offset does not fit in u32");
+        self.offsets.push(offset);
+    }
+    // for reading only
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+    // for reading only
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+    pub fn get(&self, i: usize) -> &str {
+        let start = self.offsets[i] as usize;
+        let end = self.offsets[i + 1] as usize;
+        &self.data[start..end]
+    }
+    pub fn slice(&self, start: usize, count: usize) -> StringVector {
+        assert!(
+            start + count <= self.len(),
+            "slice: start {start} and count {count} are out of index"
+        );
+        let first = self.offsets[start];
+        let last = self.offsets[start + count];
+        let data = (&self.data[first as usize..last as usize]).to_string();
+        let offsets = self.offsets[start..=start + count]
+            .iter()
+            .map(|&o| o - first)
+            .collect();
+
+        StringVector { offsets, data }
+    }
+
+    // Builds from offsets and data read from a file, checking the layout rules once.
+    // Takes ownership, so neither buffer is copied. data is already valid UTF-8 as a whole;
+    // the boundary check catches an offset that cuts a character in half.
+    pub fn from_parts(offsets: Vec<u32>, data: String) -> Result<StringVector, String> {
+        let (Some(&first), Some(&last)) = (offsets.first(), offsets.last()) else {
+            return Err("Corrupted data: string offsets are empty".to_string());
+        };
+        if first != 0 {
+            return Err(format!(
+                "Corrupted data: first string offset must be 0, got {first}"
+            ));
+        }
+        for (i, pair) in offsets.windows(2).enumerate() {
+            if pair[1] < pair[0] {
+                return Err(format!(
+                    "Corrupted data: string offset {} is smaller than the one before it",
+                    i + 1
+                ));
+            }
+        }
+        if last as usize != data.len() {
+            return Err(format!(
+                "Corrupted data: last string offset is {last} but data has {} bytes",
+                data.len()
+            ));
+        }
+        for (i, &o) in offsets.iter().enumerate() {
+            if !data.is_char_boundary(o as usize) {
+                return Err(format!(
+                    "Corrupted data: string offset {i} is not on a character boundary"
+                ));
+            }
+        }
+        Ok(StringVector { offsets, data })
+    }
+
+    #[cfg(test)]
+    pub fn from_strs(values: &[&str]) -> Self {
+        let mut v = StringVector::new();
+        for s in values {
+            v.push(s);
+        }
+        v
+    }
+}
+
+// Lets tests build one with collect(), e.g. (0..100).map(|i| format!("s{i}")).collect().
+#[cfg(test)]
+impl FromIterator<String> for StringVector {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let mut v = StringVector::new();
+        for s in iter {
+            v.push(&s);
+        }
+        v
+    }
 }
 
 impl VectorData {
@@ -104,7 +212,7 @@ impl VectorData {
             DataType::Int64 => VectorData::Int64(Vec::new()),
             DataType::Float64 => VectorData::Float64(Vec::new()),
             DataType::Date => VectorData::Date(Vec::new()),
-            DataType::Varchar => VectorData::Varchar(Vec::new()),
+            DataType::Varchar => VectorData::Varchar(StringVector::new()),
         }
     }
     // The catalog type these values belong to; the reverse of `new`.
@@ -124,14 +232,18 @@ impl VectorData {
             VectorData::Varchar(v) => v.len(),
         }
     }
-    /// Copies `count` values starting at `start` into a new VectorData.
-    pub fn slice(&self, start: usize, count: usize) -> Self {
+    /// Copies rows start..start + count into a new VectorData; the source is left unchanged.
+    /// Still &mut self from the per-String days; can become &self once Fix 5 is measured.
+    pub fn take_range(&self, start: usize, count: usize) -> Self {
         let range = start..start + count;
         match self {
+            // ALLOC: fixed width is copied, one memcpy per column per DataChunk; cheap, and the
+            // rows left behind are simply never read.
             VectorData::Int64(v) => VectorData::Int64(v[range].to_vec()),
             VectorData::Float64(v) => VectorData::Float64(v[range].to_vec()),
             VectorData::Date(v) => VectorData::Date(v[range].to_vec()),
-            VectorData::Varchar(v) => VectorData::Varchar(v[range].to_vec()),
+            // ALLOC: two buffers (offsets, bytes) per DataChunk, one memcpy each.
+            VectorData::Varchar(v) => VectorData::Varchar(v.slice(start, count)),
         }
     }
     pub fn format(&self, row: usize) -> String {
@@ -139,7 +251,7 @@ impl VectorData {
             VectorData::Int64(v) => v[row].to_string(),
             VectorData::Float64(v) => v[row].to_string(),
             VectorData::Date(v) => format_date(v[row]),
-            VectorData::Varchar(v) => v[row].clone(),
+            VectorData::Varchar(v) => v.get(row).to_string(),
         }
     }
 }
@@ -166,12 +278,13 @@ pub struct Vector {
     pub validity: Bitmap, // one bit per value: which of those values are NULL
 }
 impl Vector {
-    // Copies rows start..start + count; start must be a multiple of 64 (Scan slices at multiples of 2048).
-    pub fn slice(&self, start: usize, count: usize) -> Vector {
-        // Bitmap first: its asserts are cheap and give clear messages before any values are copied.
+    // Copies rows start..start + count into a new Vector (see VectorData::take_range),
+    // values and bitmap. start must be a multiple of 64 (Scan takes at multiples of 2048).
+    pub fn take_range(&mut self, start: usize, count: usize) -> Vector {
+        // Bitmap first: its asserts are cheap and give clear messages before any values are moved.
         let validity = self.validity.slice(start, count);
         Vector {
-            data: self.data.slice(start, count),
+            data: self.data.take_range(start, count),
             validity,
         }
     }
@@ -185,19 +298,22 @@ pub struct DataChunk {
 }
 
 pub trait Operator {
-    fn next(&mut self) -> Option<DataChunk>;
+    fn next(&mut self) -> Result<Option<DataChunk>, String>;
 }
 
 pub trait TableSource {
-    fn num_rows(&self) -> usize;
-    /// Read `count` values of one column, starting at row `start`.
-    fn read(&self, column: usize, start: usize, count: usize) -> Vector;
+    fn num_row_groups(&self) -> usize;
+    fn row_group_num_rows(&self, rg: usize) -> usize;
+    fn read_row_group(&self, rg: usize, columns: &[usize]) -> Result<Vec<Vector>, String>;
 }
 
 pub struct Scan {
     source: Box<dyn TableSource>,
     columns: Vec<usize>, // which columns to read, e.g. vec![4, 6] for l_quantity, l_discount
-    position: usize,     // next row to read
+    current: Vec<Vector>, // decoded columns of the loaded row group, one per entry of columns; empty before the first load
+    curret_rg: usize,     // next rg to load
+    position: usize,      // row in the loaded group to hand out next
+    current_rows: usize,  // how many rows the loaded group has
 }
 
 impl Scan {
@@ -205,29 +321,53 @@ impl Scan {
         Scan {
             source,
             columns,
+            current: Vec::new(),
+            curret_rg: 0,
             position: 0,
+            current_rows: 0,
         }
     }
 }
 
 // Scan(Table) : Dataflow
-// The Scan operator retrieves data vector-at-a-time from
+// The Scan operator retrieves data vector-at-a-time from the table source
 impl Operator for Scan {
-    fn next(&mut self) -> Option<DataChunk> {
-        let remaining = self.source.num_rows() - self.position;
-        if remaining == 0 {
-            return None; // done
+    fn next(&mut self) -> Result<Option<DataChunk>, String> {
+        // Load the next row group until one has rows left (or none remain).
+        while self.position == self.current_rows {
+            if self.curret_rg == self.source.num_row_groups() {
+                return Ok(None); // every group has been read
+            }
+            // FREE: assigning drops the previous group: its large Vecs (munmap), Varchar
+            // included, since each column is just two buffers now.
+            self.current = self.source.read_row_group(self.curret_rg, &self.columns)?;
+            self.current_rows = self.source.row_group_num_rows(self.curret_rg); // same group as the read
+            // Vectors that don't match the source's own row count are a source bug: say so here,
+            // not later as a confusing take_range panic.
+            debug_assert!(
+                self.current
+                    .iter()
+                    .all(|v| v.data.len() == self.current_rows),
+                "row group {} returned Vectors that don't have {} rows",
+                self.curret_rg,
+                self.current_rows
+            );
+            self.position = 0; // a new group starts at its first row
+            self.curret_rg += 1;
         }
-        let count = remaining.min(VECTOR_SIZE); // the last chunk can be smaller
-
+        // Hand out the next piece: up to VECTOR_SIZE rows from position.
+        let count = std::cmp::min(VECTOR_SIZE, self.current_rows - self.position);
+        // cuts each col into 2048 pieces and passes them up the operator tree
+        // ALLOC: one Vec<Vector> per DataChunk plus, per column, a bitmap copy and a Vec
+        // (fixed width: a copy; Varchar: offsets and one byte range, see StringVector::slice).
         let columns = self
-            .columns
-            .iter()
-            .map(|&col| self.source.read(col, self.position, count))
+            .current
+            .iter_mut()
+            .map(|col| col.take_range(self.position, count))
             .collect();
 
         self.position += count;
-        Some(DataChunk { columns, count })
+        Ok(Some(DataChunk { columns, count }))
     }
 }
 
@@ -329,28 +469,45 @@ mod tests {
     }
 
     #[test]
-    fn vector_slice_int() {
-        let source = vector(VectorData::Int64((0..200).collect()), &[5, 70, 100, 150]);
+    fn take_range_int() {
+        let mut source = vector(VectorData::Int64((0..200).collect()), &[5, 70, 100, 150]);
         // Rows 64..100: NULL at 70 lands at 6; the NULL at 100 is just past the end.
         let expected = vector(VectorData::Int64((64..100).collect()), &[6]);
-        assert_eq!(source.slice(64, 36), expected);
+        assert_eq!(source.take_range(64, 36), expected);
     }
 
     #[test]
-    fn vector_slice_varchar() {
-        let strings: Vec<String> = (0..130).map(|i| format!("s{i}")).collect();
-        let source = vector(VectorData::Varchar(strings), &[64, 66, 129]);
+    fn take_range_int_copies() {
+        // Fixed width is copied, so the source keeps its values.
+        let mut source = vector(VectorData::Int64((0..200).collect()), &[5]);
+        source.take_range(64, 36);
+        assert_eq!(source, vector(VectorData::Int64((0..200).collect()), &[5]));
+    }
+
+    #[test]
+    fn take_range_varchar() {
+        let strings: StringVector = (0..130).map(|i| format!("s{i}")).collect();
+        let mut source = vector(VectorData::Varchar(strings), &[64, 66, 129]);
         let expected_strings = (64..130).map(|i| format!("s{i}")).collect();
         // Values and NULLs stay together: NULLs at 64, 66, 129 land at 0, 2, 65.
         let expected = vector(VectorData::Varchar(expected_strings), &[0, 2, 65]);
-        assert_eq!(source.slice(64, 66), expected);
+        assert_eq!(source.take_range(64, 66), expected);
     }
 
     #[test]
-    fn vector_slice_last_short_slice() {
+    fn take_range_varchar_copies() {
+        // Varchar is copied now too (one byte range), so the source keeps its values.
+        let strings: StringVector = (0..200).map(|i| format!("s{i}")).collect();
+        let mut source = vector(VectorData::Varchar(strings.clone()), &[70]);
+        source.take_range(64, 36);
+        assert_eq!(source, vector(VectorData::Varchar(strings), &[70]));
+    }
+
+    #[test]
+    fn take_range_last_short_range() {
         // A 4,464-row row group cut into 2048-row DataChunks: 2048, 2048, then 368.
-        let source = vector(VectorData::Int64((0..4_464).collect()), &[4_096, 4_463]);
-        let last = source.slice(4_096, 368);
+        let mut source = vector(VectorData::Int64((0..4_464).collect()), &[4_096, 4_463]);
+        let last = source.take_range(4_096, 368);
         assert_eq!(
             last,
             vector(VectorData::Int64((4_096..4_464).collect()), &[0, 367])
@@ -360,14 +517,142 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "multiple of 64")]
-    fn vector_slice_rejects_unaligned_start() {
+    fn take_range_rejects_unaligned_start() {
         let strings = (0..100).map(|i| format!("s{i}")).collect();
-        vector(VectorData::Varchar(strings), &[]).slice(10, 20);
+        vector(VectorData::Varchar(strings), &[]).take_range(10, 20);
     }
 
     #[test]
     #[should_panic(expected = "slice")]
     fn slice_too_many_rows() {
         bitmap_200().slice(128, 129); // 3 words from word 2, but only 4 words exist
+    }
+
+    #[test]
+    fn string_vector_empty() {
+        assert_eq!(StringVector::new().len(), 0);
+    }
+
+    #[test]
+    fn string_vector_push_get() {
+        let mut v = StringVector::new();
+        for s in ["AIR", "", "TRUCK", "café"] {
+            v.push(s);
+        }
+        assert_eq!(v.len(), 4); // values, not bytes (would be 13)
+        assert_eq!(v.get(0), "AIR");
+        assert_eq!(v.get(1), "");
+        assert_eq!(v.get(2), "TRUCK");
+        assert_eq!(v.get(3), "café"); // 5 bytes, 4 chars
+    }
+
+    #[test]
+    fn string_vector_only_empty_values() {
+        // Empty values add offsets but no bytes.
+        let mut v = StringVector::new();
+        v.push("");
+        v.push("");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(0), "");
+        assert_eq!(v.get(1), "");
+    }
+
+    #[test]
+    fn string_vector_from_strs() {
+        let mut pushed = StringVector::new();
+        pushed.push("a");
+        pushed.push("");
+        pushed.push("bc");
+        assert_eq!(StringVector::from_strs(&["a", "", "bc"]), pushed);
+    }
+
+    fn air_truck_ship() -> StringVector {
+        StringVector::from_strs(&["AIR", "", "TRUCK", "SHIP"]) // offsets [0, 3, 3, 8, 12]
+    }
+
+    #[test]
+    fn string_vector_slice_middle() {
+        let slice = air_truck_ship().slice(2, 2);
+        assert_eq!(slice.offsets, [0, 5, 9]); // rebased: [3, 8, 12] minus 3
+        assert_eq!(slice, StringVector::from_strs(&["TRUCK", "SHIP"]));
+    }
+
+    #[test]
+    fn string_vector_slice_from_start() {
+        let slice = air_truck_ship().slice(0, 2);
+        assert_eq!(slice, StringVector::from_strs(&["AIR", ""]));
+    }
+
+    #[test]
+    fn string_vector_slice_at_end() {
+        let slice = air_truck_ship().slice(3, 1);
+        assert_eq!(slice, StringVector::from_strs(&["SHIP"]));
+    }
+
+    #[test]
+    fn string_vector_slice_empty() {
+        let slice = air_truck_ship().slice(1, 0);
+        assert_eq!(slice.len(), 0);
+        assert_eq!(slice, StringVector::new()); // offsets [0]
+    }
+
+    #[test]
+    fn string_vector_slice_whole() {
+        let source = air_truck_ship();
+        assert_eq!(source.slice(0, source.len()), source);
+    }
+
+    #[test]
+    fn string_vector_slice_leaves_source() {
+        let source = air_truck_ship();
+        source.slice(1, 2);
+        assert_eq!(source, air_truck_ship());
+    }
+
+    #[test]
+    fn string_vector_slice_multibyte() {
+        let slice = StringVector::from_strs(&["a", "café", "b"]).slice(1, 1);
+        assert_eq!(slice.get(0), "café");
+        assert_eq!(slice.offsets, [0, 5]); // bytes, not chars
+    }
+
+    #[test]
+    #[should_panic(expected = "slice")]
+    fn string_vector_slice_out_of_range() {
+        air_truck_ship().slice(3, 2);
+    }
+
+    fn from_parts_err(offsets: Vec<u32>, data: &str) -> String {
+        StringVector::from_parts(offsets, data.to_string()).unwrap_err()
+    }
+
+    #[test]
+    fn string_vector_from_parts() {
+        let v = StringVector::from_parts(vec![0, 3, 3, 8], "AIRTRUCK".to_string()).unwrap();
+        assert_eq!(v, StringVector::from_strs(&["AIR", "", "TRUCK"]));
+    }
+
+    #[test]
+    fn string_vector_from_parts_empty() {
+        let v = StringVector::from_parts(vec![0], String::new()).unwrap();
+        assert_eq!(v, StringVector::new());
+    }
+
+    #[test]
+    fn string_vector_from_parts_bad() {
+        assert!(from_parts_err(vec![], "").contains("empty"));
+        assert!(from_parts_err(vec![1, 3], "AIR").contains("must be 0"));
+        assert!(from_parts_err(vec![0, 3, 2, 3], "AIR").contains("offset 2 is smaller"));
+        assert!(from_parts_err(vec![0, 2], "AIR").contains("data has 3 bytes"));
+        // "café": é is bytes 3..5, so offset 4 cuts it in half
+        assert!(from_parts_err(vec![0, 4, 5], "café").contains("offset 1 is not on a character"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn string_vector_get_out_of_range() {
+        let mut v = StringVector::new();
+        v.push("AIR");
+        v.get(1);
     }
 }

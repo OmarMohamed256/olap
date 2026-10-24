@@ -9,7 +9,7 @@ fn push_field(column: &mut VectorData, field: &str) {
         VectorData::Int64(v) => v.push(field.parse().unwrap()),
         VectorData::Float64(v) => v.push(field.parse().unwrap()),
         VectorData::Date(v) => v.push(parse_date(field)),
-        VectorData::Varchar(v) => v.push(field.to_string()),
+        VectorData::Varchar(v) => v.push(field),
     }
 }
 
@@ -72,14 +72,35 @@ impl CsvTable {
 }
 
 impl TableSource for CsvTable {
-    fn num_rows(&self) -> usize {
-        self.columns[0].len()
+    fn num_row_groups(&self) -> usize {
+        1
     }
 
-    fn read(&self, column: usize, start: usize, count: usize) -> Vector {
-        Vector {
-            data: self.columns[column].slice(start, count),
-            validity: Bitmap::all_valid(count),
+    fn row_group_num_rows(&self, _rg: usize) -> usize {
+        // first() is None for a table with no columns, which has no rows
+        self.columns.first().map_or(0, |column| column.len())
+    }
+
+    fn read_row_group(&self, rg: usize, columns: &[usize]) -> Result<Vec<Vector>, String> {
+        if rg != 0 {
+            return Err(format!("CSV table has one row group, asked for {rg}"));
         }
+        let num_rows = self.row_group_num_rows(rg);
+        // Copies each column: the table keeps its own data and Scan needs owned Vectors.
+        // CSV has no NULLs, so every row is valid.
+        columns
+            .iter()
+            .map(|&column| {
+                let data = self
+                    .columns
+                    .get(column)
+                    .ok_or(format!("column {column} out of range"))?
+                    .clone();
+                Ok(Vector {
+                    data,
+                    validity: Bitmap::all_valid(num_rows),
+                })
+            })
+            .collect()
     }
 }
