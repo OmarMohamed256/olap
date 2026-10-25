@@ -5,6 +5,7 @@ mod storage;
 
 use std::collections::HashMap;
 use std::fs;
+use std::hint::black_box;
 use std::time::Instant;
 
 use sqlparser::ast::{LimitClause, SelectItem, SetExpr, Statement, TableFactor};
@@ -19,32 +20,6 @@ use crate::storage::pax::{self, PaxFile};
 const DATA_DIR: &str = "data/sf0.1";
 
 fn main() {
-    //     let catalog = Catalog::tpch();
-    //     // Tables are loaded from CSV the first time a query uses them.
-    //     let mut tables: HashMap<String, Vec<VectorData>> = HashMap::new();
-    //
-    //     loop {
-    //         print!("> ");
-    //         io::stdout().flush().unwrap();
-    //
-    //         let mut line = String::new();
-    //         if io::stdin().read_line(&mut line).unwrap() == 0 {
-    //             break; // Ctrl-D
-    //         }
-    //         let sql = line.trim();
-    //         if sql.is_empty() {
-    //             continue;
-    //         }
-    //         if sql == "exit" || sql == "quit" {
-    //             break;
-    //         }
-    //
-    //         if let Err(e) = run(sql, &catalog, &mut tables) {
-    //             println!("error: {e}");
-    //         }
-    //     }
-    //
-
     // CSV -> PAX: load lineitem, write it with our own writer, compare sizes.
     let catalog = Catalog::tpch();
     let schema = catalog.get("lineitem").unwrap();
@@ -89,8 +64,8 @@ fn main() {
         println!("{path}: {:.1} MB", bytes as f64 / 1e6);
     }
 
-    // Scan the same columns from CSV and PAX. Equal checksums mean the PAX reader returns
-    // the same data; the times compare querying each file from disk.
+    // Times scanning the same columns from CSV and PAX, from disk. Correctness of the data is
+    // checked by tests (pax.rs scan_projects_columns); here only the row counts must agree.
     // CSV has to be parsed on every query, so its time includes load_csv; PAX includes open.
     let rows = columns[0].data.len();
     let csv_bytes = fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
@@ -104,21 +79,19 @@ fn main() {
         ("varchar only", &vec![8, 9, 13]),
         ("all columns", &all),
     ] {
-        // Where l_quantity (column 4) sits in the chunk, for the checksum; None if not scanned.
-        let sum_at = scan_columns.iter().position(|&c| c == 4);
         let pax_bytes = pax_file.columns_bytes(scan_columns);
 
         let csv = bench::measure(&format!("csv {label}"), 3, rows, csv_bytes, || {
             let source = CsvTable::load(&csv_path, schema);
-            drain(Scan::new(Box::new(source), scan_columns.clone()), sum_at).unwrap()
+            drain(Scan::new(Box::new(source), scan_columns.clone(), Vec::new())).unwrap()
         });
         let pax = bench::measure(&format!("pax {label}"), 10, rows, pax_bytes, || {
             let source = PaxFile::open(&pax_path).unwrap();
-            drain(Scan::new(Box::new(source), scan_columns.clone()), sum_at).unwrap()
+            drain(Scan::new(Box::new(source), scan_columns.clone(), Vec::new())).unwrap()
         });
-        println!(
-            "  checksums csv {csv:?}, pax {pax:?}, match: {}",
-            csv == pax
+        assert_eq!(
+            csv, pax,
+            "{label}: CSV and PAX scanned different row counts"
         );
     }
 }
@@ -140,39 +113,38 @@ fn pax_only(
         None => 20,
     };
     if let Some(c) = columns.iter().find(|&&c| c >= num_columns) {
-        return Err(format!("column {c} out of range: the table has {num_columns}"));
+        return Err(format!(
+            "column {c} out of range: the table has {num_columns}"
+        ));
     }
 
     let file = PaxFile::open(path)?;
-    let rows = (0..file.num_row_groups()).map(|g| file.row_group_num_rows(g)).sum();
+    let rows = (0..file.num_row_groups())
+        .map(|g| file.row_group_num_rows(g))
+        .sum();
     let bytes = file.columns_bytes(&columns);
-    let sum_at = columns.iter().position(|&c| c == 4);
 
-    let result = bench::measure(&format!("pax {columns:?}"), runs, rows, bytes, || {
+    let scanned = bench::measure(&format!("pax {columns:?}"), runs, rows, bytes, || {
         let source = PaxFile::open(path).unwrap();
-        drain(Scan::new(Box::new(source), columns.clone()), sum_at).unwrap()
+        drain(Scan::new(Box::new(source), columns.clone(), Vec::new())).unwrap()
     });
-    println!("  checksum {result:?}, {:.1} MB scanned per run", bytes as f64 / 1e6);
+    println!(
+        "  {scanned} rows, {:.1} MB scanned per run",
+        bytes as f64 / 1e6
+    );
     Ok(())
 }
 
-// Pulls every chunk out of a Scan. Returns (rows, sum of the Float64 column at `sum_at`)
-// as a checksum: it checks the data and stops the compiler from skipping the scan.
-// With sum_at = None the checksum is only the row count.
-fn drain(mut scan: Scan, sum_at: Option<usize>) -> Result<(usize, f64), String> {
+// Pulls every chunk out of a Scan and returns the row count. black_box stops the compiler
+// from skipping work whose result is unused.
+fn drain(mut scan: Scan) -> Result<usize, String> {
     let mut rows = 0;
-    let mut sum = 0.0;
     // FREE: each chunk is dropped at the end of the loop body: its Vecs (Varchar: two buffers
     // per column, offsets and bytes).
     while let Some(chunk) = scan.next()? {
-        rows += chunk.count;
-        if let Some(i) = sum_at {
-            if let VectorData::Float64(values) = &chunk.columns[i].data {
-                sum += values.iter().sum::<f64>();
-            }
-        }
+        rows += black_box(&chunk).count;
     }
-    Ok((rows, sum))
+    Ok(rows)
 }
 
 /// Runs `SELECT * FROM <table> [LIMIT n]` and prints the result.

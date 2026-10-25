@@ -1,3 +1,5 @@
+use std::{cmp::Ordering, ops::Bound};
+
 use crate::catalog::DataType;
 
 pub const VECTOR_SIZE: usize = 2048;
@@ -89,6 +91,46 @@ impl Bitmap {
         self.words[i / 64] &= !(1 << (i % 64));
     }
 }
+// One value of a column, e.g. a zone map min/max or a filter bound.
+// Variants mirror catalog::DataType one-to-one.
+// No PartialOrd derive: it would order by variant first, so I64(1000) < F64(0.5).
+#[derive(Debug, PartialEq, Clone)]
+pub enum Scalar {
+    I64(i64),
+    F64(f64),
+    Date(i32), // days since 1970-01-01, same as catalog::DataType::Date
+    String(String),
+}
+
+impl Scalar {
+    // None when the two can't be ordered: different types, or a NaN.
+    pub fn compare(&self, other: &Scalar) -> Option<Ordering> {
+        match (self, other) {
+            (Scalar::I64(a), Scalar::I64(b)) => Some(a.cmp(b)),
+            // f64 has NaN, which comes from things like
+            // 0.0 / 0.0 or (-1.0).sqrt().
+            // By the IEEE 754 standard, which every CPU follows,
+            // NaN is not less than, equal to or greater than anything,
+            // not even itself
+            // So for floats, "which is bigger?" sometimes has no answer.
+            // That's a partial order, and Rust expresses it with the trait PartialOrd.
+            // Its method partial_cmp returns Option<Ordering>: Some(...) when there's an answer,
+            // and None when NaN is involved.
+            (Scalar::F64(a), Scalar::F64(b)) => a.partial_cmp(b),
+            (Scalar::Date(a), Scalar::Date(b)) => Some(a.cmp(b)),
+            (Scalar::String(a), Scalar::String(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRange {
+    pub column: usize,
+    pub low: Bound<Scalar>,
+    pub high: Bound<Scalar>,
+}
+
 // The values of one column, without validity (that lives in Vector.validity).
 // NULL rows still take a slot so value i always belongs to row i.
 #[derive(Debug, PartialEq, Clone)]
@@ -305,27 +347,46 @@ pub trait TableSource {
     fn num_row_groups(&self) -> usize;
     fn row_group_num_rows(&self, rg: usize) -> usize;
     fn read_row_group(&self, rg: usize, columns: &[usize]) -> Result<Vec<Vector>, String>;
+    // Could row group rg hold a row inside every range? true = must read it. The default
+    // (no statistics, e.g. CSV) can never rule a group out.
+    fn may_match(&self, _rg: usize, _pushed_filters: &[ColumnRange]) -> bool {
+        true
+    }
 }
 
 pub struct Scan {
     source: Box<dyn TableSource>,
     columns: Vec<usize>, // which columns to read, e.g. vec![4, 6] for l_quantity, l_discount
+    // Used only to skip row groups via the source's statistics; rows that fail can still be
+    // returned, so a Filter above must check them.
+    pushed_filters: Vec<ColumnRange>,
     current: Vec<Vector>, // decoded columns of the loaded row group, one per entry of columns; empty before the first load
     curret_rg: usize,     // next rg to load
     position: usize,      // row in the loaded group to hand out next
     current_rows: usize,  // how many rows the loaded group has
+    skipped_groups: usize, // groups pushed_filters ruled out, never read
 }
 
 impl Scan {
-    pub fn new(source: Box<dyn TableSource>, columns: Vec<usize>) -> Self {
+    pub fn new(
+        source: Box<dyn TableSource>,
+        columns: Vec<usize>,
+        pushed_filters: Vec<ColumnRange>,
+    ) -> Self {
         Scan {
             source,
             columns,
+            pushed_filters,
             current: Vec::new(),
             curret_rg: 0,
             position: 0,
             current_rows: 0,
+            skipped_groups: 0,
         }
+    }
+
+    pub fn skipped_groups(&self) -> usize {
+        self.skipped_groups
     }
 }
 
@@ -338,21 +399,28 @@ impl Operator for Scan {
             if self.curret_rg == self.source.num_row_groups() {
                 return Ok(None); // every group has been read
             }
-            // FREE: assigning drops the previous group: its large Vecs (munmap), Varchar
-            // included, since each column is just two buffers now.
-            self.current = self.source.read_row_group(self.curret_rg, &self.columns)?;
-            self.current_rows = self.source.row_group_num_rows(self.curret_rg); // same group as the read
-            // Vectors that don't match the source's own row count are a source bug: say so here,
-            // not later as a confusing take_range panic.
-            debug_assert!(
-                self.current
-                    .iter()
-                    .all(|v| v.data.len() == self.current_rows),
-                "row group {} returned Vectors that don't have {} rows",
-                self.curret_rg,
-                self.current_rows
-            );
-            self.position = 0; // a new group starts at its first row
+            // A skipped group changes nothing but curret_rg: position == current_rows still
+            // holds, so the loop moves on instead of handing out the old group's rows again.
+            let may_match = self.source.may_match(self.curret_rg, &self.pushed_filters);
+            if may_match {
+                // FREE: assigning drops the previous group: its large Vecs (munmap), Varchar
+                // included, since each column is just two buffers now.
+                self.current = self.source.read_row_group(self.curret_rg, &self.columns)?;
+                self.current_rows = self.source.row_group_num_rows(self.curret_rg); // same group as the read
+                // Vectors that don't match the source's own row count are a source bug: say so here,
+                // not later as a confusing take_range panic.
+                debug_assert!(
+                    self.current
+                        .iter()
+                        .all(|v| v.data.len() == self.current_rows),
+                    "row group {} returned Vectors that don't have {} rows",
+                    self.curret_rg,
+                    self.current_rows
+                );
+                self.position = 0; // a new group starts at its first row
+            } else {
+                self.skipped_groups += 1;
+            }
             self.curret_rg += 1;
         }
         // Hand out the next piece: up to VECTOR_SIZE rows from position.
@@ -526,6 +594,58 @@ mod tests {
     #[should_panic(expected = "slice")]
     fn slice_too_many_rows() {
         bitmap_200().slice(128, 129); // 3 words from word 2, but only 4 words exist
+    }
+
+    #[test]
+    fn compare_same_type() {
+        use Ordering::*;
+        let cases = [
+            (Scalar::I64(-5), Scalar::I64(3), Less),
+            (Scalar::I64(3), Scalar::I64(3), Equal),
+            (Scalar::F64(2.5), Scalar::F64(-1.0), Greater),
+            (Scalar::F64(0.0), Scalar::F64(-0.0), Equal), // IEEE: 0.0 == -0.0
+            (Scalar::Date(8_766), Scalar::Date(9_131), Less), // 1994-01-01 < 1995-01-01
+            (
+                Scalar::String("AIR".to_string()),
+                Scalar::String("TRUCK".to_string()),
+                Less,
+            ),
+            (
+                Scalar::String("".to_string()),
+                Scalar::String("AIR".to_string()),
+                Less,
+            ),
+            // Byte order: uppercase (0x41..) sorts before lowercase (0x61..)
+            (
+                Scalar::String("a".to_string()),
+                Scalar::String("Z".to_string()),
+                Greater,
+            ),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(a.compare(&b), Some(expected), "{a:?} vs {b:?}");
+            assert_eq!(b.compare(&a), Some(expected.reverse()), "{b:?} vs {a:?}");
+        }
+    }
+
+    #[test]
+    fn compare_nan_is_none() {
+        let nan = Scalar::F64(f64::NAN);
+        assert_eq!(nan.compare(&Scalar::F64(1.0)), None);
+        assert_eq!(Scalar::F64(1.0).compare(&nan), None);
+        assert_eq!(nan.compare(&nan), None); // not even equal to itself
+    }
+
+    #[test]
+    fn compare_mixed_types_is_none() {
+        // A derived PartialOrd would order these by variant and call I64 smaller.
+        assert_eq!(Scalar::I64(1000).compare(&Scalar::F64(0.5)), None);
+        assert_eq!(Scalar::I64(1).compare(&Scalar::F64(1.0)), None);
+        assert_eq!(Scalar::Date(1).compare(&Scalar::I64(1)), None);
+        assert_eq!(
+            Scalar::String("1".to_string()).compare(&Scalar::I64(1)),
+            None
+        );
     }
 
     #[test]

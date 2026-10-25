@@ -3,10 +3,12 @@ const MAGIC: [u8; 4] = *b"PAX1";
 const ROW_GROUP_SIZE: usize = 65_536;
 use crate::{
     catalog::{Column, DataType, TableSchema},
-    exec::exec::{Bitmap, StringVector, TableSource, Vector, VectorData},
+    exec::exec::{Bitmap, ColumnRange, Scalar, StringVector, TableSource, Vector, VectorData},
 };
+use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write}; // traits that add read_exact, seek and write_all to File
+use std::ops::Bound;
 use std::os::unix::fs::FileExt; // adds read_exact_at: read at an offset without moving the cursor
 
 impl Column {
@@ -105,15 +107,7 @@ impl TableSchema {
     }
 }
 
-// One value of a column, used for zone map min/max.
-// Variants mirror catalog::DataType one-to-one.
-#[derive(Debug, PartialEq)]
-pub enum Scalar {
-    I64(i64),
-    F64(f64),
-    Date(i32), // days since 1970-01-01, same as catalog::DataType::Date
-    String(String),
-}
+// Scalar's PAX byte format; the type itself lives in exec.
 impl Scalar {
     // No type tag is written: the decoder learns the type from the schema column.
     pub fn encode(&self, buffer: &mut Vec<u8>) {
@@ -491,7 +485,9 @@ impl VectorData {
 
                 // 4. from_parts checks the offsets (start at 0, never decrease, end at data_len,
                 // on character boundaries) and returns Err on corrupt data instead of panicking.
-                Ok(VectorData::Varchar(StringVector::from_parts(offsets, text)?))
+                Ok(VectorData::Varchar(StringVector::from_parts(
+                    offsets, text,
+                )?))
             }
         }
     }
@@ -886,6 +882,59 @@ impl TableSource for PaxFile {
             .iter()
             .map(|&column| self.read_chunk(group, column))
             .collect()
+    }
+
+    // False only when a zone map proves no row of the group can pass some range. Anything
+    // uncertain (no answer from compare, unknown column) counts as "may match": skipping
+    // wrongly loses rows, keeping wrongly only costs a read.
+    fn may_match(&self, rg: usize, pushed_filters: &[ColumnRange]) -> bool {
+        let chunks = &self.footer.row_groups_metadata[rg].chunks_metadata;
+        for range in pushed_filters {
+            let Some(chunk) = chunks.get(range.column) else {
+                continue; // unknown column: can't tell
+            };
+            // All NULL: a comparison with NULL is never true, so no row can pass.
+            let Some(zm) = &chunk.zone_map else {
+                return false;
+            };
+            // e.g. price > 20 AND price < 300: skip if max <= 20 or min >= 300
+            let lower_bound_cannot_match = match &range.low {
+                Bound::Included(low) => {
+                    // zm.max < low
+                    matches!(zm.max.compare(low), Some(Ordering::Less))
+                }
+                Bound::Excluded(low) => {
+                    // zm.max <= low
+                    matches!(zm.max.compare(low), Some(Ordering::Less | Ordering::Equal))
+                }
+                Bound::Unbounded => false, // no limit can't rule anything out
+            };
+
+            if lower_bound_cannot_match {
+                return false;
+            }
+
+            let upper_bound_cannot_match = match &range.high {
+                Bound::Included(high) => {
+                    // zm.min > high
+                    matches!(zm.min.compare(high), Some(Ordering::Greater))
+                }
+                Bound::Excluded(high) => {
+                    // zm.min >= high
+                    matches!(
+                        zm.min.compare(high),
+                        Some(Ordering::Greater | Ordering::Equal)
+                    )
+                }
+                Bound::Unbounded => false,
+            };
+            if upper_bound_cannot_match {
+                return false;
+            }
+        }
+
+        // If we made it through all ranges without returning false, it may match
+        true
     }
 }
 
@@ -1812,6 +1861,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scan_projects_columns() {
+        use crate::exec::exec::{Operator, Scan};
+        let (pax, columns) = open_mixed("scan_projects_columns");
+        // Reversed order: chunk column j holds table column wanted[j], not column j.
+        let wanted = [1, 0];
+        let mut scan = Scan::new(Box::new(pax), wanted.to_vec(), Vec::new());
+        let mut row = 0;
+        let mut counts = Vec::new();
+        while let Some(chunk) = scan.next().unwrap() {
+            assert_eq!(chunk.columns.len(), wanted.len());
+            for (j, &column) in wanted.iter().enumerate() {
+                assert_eq!(
+                    chunk.columns[j],
+                    copy_rows(&columns[column], row, chunk.count),
+                    "row {row} column {column}"
+                );
+            }
+            row += chunk.count;
+            counts.push(chunk.count);
+        }
+        assert_eq!(row, 70_000);
+        // Group 0 gives 32 chunks of 2048; group 1 (4,464 rows) gives 2048, 2048, 368.
+        // Chunks never span two groups.
+        assert_eq!(counts.len(), 35);
+        assert!(counts[..34].iter().all(|&c| c == 2048));
+        assert_eq!(counts[34], 368);
+    }
+
+    // A range on mixed_columns' Int64 column 0. Its zone maps: group 0 holds 1..=65_535
+    // (row 0 is NULL), group 1 holds 65_536..=69_999.
+    fn int_range(low: Bound<i64>, high: Bound<i64>) -> ColumnRange {
+        ColumnRange {
+            column: 0,
+            low: low.map(Scalar::I64),
+            high: high.map(Scalar::I64),
+        }
+    }
+
+    // may_match for groups 0 and 1.
+    fn groups_kept(pax: &PaxFile, ranges: &[ColumnRange]) -> [bool; 2] {
+        [pax.may_match(0, ranges), pax.may_match(1, ranges)]
+    }
+
+    #[test]
+    fn may_match_skips_groups_outside_range() {
+        use Bound::*;
+        let (pax, _) = open_mixed("may_match_skips_groups_outside_range");
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Included(66_000), Unbounded)]),
+            [false, true]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Unbounded, Excluded(100))]),
+            [true, false]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Included(70_000), Unbounded)]),
+            [false, false]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Unbounded, Unbounded)]),
+            [true, true]
+        );
+        assert_eq!(groups_kept(&pax, &[]), [true, true]); // no filter
+    }
+
+    #[test]
+    fn may_match_edges() {
+        use Bound::*;
+        let (pax, _) = open_mixed("may_match_edges");
+        // Group 0's max is 65_535, group 1's min is 65_536.
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Included(65_535), Unbounded)]),
+            [true, true]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Excluded(65_535), Unbounded)]),
+            [false, true]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Unbounded, Included(65_536))]),
+            [true, true]
+        );
+        assert_eq!(
+            groups_kept(&pax, &[int_range(Unbounded, Excluded(65_536))]),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn may_match_ands_ranges() {
+        use Bound::*;
+        let (pax, _) = open_mixed("may_match_ands_ranges");
+        // Each range alone keeps one group, a different one; ANDed, neither group fits both.
+        let only_group_0 = int_range(Unbounded, Excluded(65_536));
+        let only_group_1 = int_range(Included(65_536), Unbounded);
+        assert_eq!(groups_kept(&pax, &[only_group_0.clone()]), [true, false]);
+        assert_eq!(groups_kept(&pax, &[only_group_1.clone()]), [false, true]);
+        assert_eq!(
+            groups_kept(&pax, &[only_group_0, only_group_1]),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn may_match_keeps_when_unsure() {
+        let (pax, _) = open_mixed("may_match_keeps_when_unsure");
+        // A Date bound on an Int64 column: compare says None, so nothing may be skipped.
+        let wrong_type = ColumnRange {
+            column: 0,
+            low: Bound::Included(Scalar::Date(1_000_000)),
+            high: Bound::Unbounded,
+        };
+        assert_eq!(groups_kept(&pax, &[wrong_type]), [true, true]);
+        let unknown_column = ColumnRange {
+            column: 99,
+            ..int_range(Bound::Included(1_000_000), Bound::Unbounded)
+        };
+        assert_eq!(groups_kept(&pax, &[unknown_column]), [true, true]);
+    }
+
+    #[test]
+    fn may_match_skips_all_null_chunk() {
+        let path = temp_path("may_match_skips_all_null_chunk");
+        let schema = TableSchema::new("t", vec![Column::new("a", DataType::Int64)]);
+        let mut validity = Bitmap::all_valid(100);
+        for i in 0..100 {
+            validity.set_null(i);
+        }
+        let column = Vector {
+            data: VectorData::Int64(vec![0; 100]),
+            validity,
+        };
+        write(&path, &schema, &[column]).unwrap();
+        let pax = PaxFile::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        // No zone map at all; even an unbounded range can't match NULLs.
+        let range = int_range(Bound::Unbounded, Bound::Unbounded);
+        assert!(!pax.unwrap().may_match(0, &[range]));
+    }
+
+    // Scans mixed_columns' column 0 with `filters`; checks every chunk against the original
+    // rows, starting at row `first_row`. Returns (rows scanned, groups skipped).
+    fn scan_filtered(name: &str, filters: Vec<ColumnRange>, first_row: usize) -> (usize, usize) {
+        use crate::exec::exec::{Operator, Scan};
+        let (pax, columns) = open_mixed(name);
+        let mut scan = Scan::new(Box::new(pax), vec![0], filters);
+        let mut row = first_row;
+        while let Some(chunk) = scan.next().unwrap() {
+            assert_eq!(chunk.columns[0], copy_rows(&columns[0], row, chunk.count), "row {row}");
+            row += chunk.count;
+        }
+        (row - first_row, scan.skipped_groups())
+    }
+
+    #[test]
+    fn scan_skips_second_group() {
+        // A skipped group after a read one must not hand out the read group's rows again.
+        let filters = vec![int_range(Bound::Unbounded, Bound::Excluded(65_536))];
+        assert_eq!(scan_filtered("scan_skips_second_group", filters, 0), (65_536, 1));
+    }
+
+    #[test]
+    fn scan_skips_first_group() {
+        let filters = vec![int_range(Bound::Included(65_536), Bound::Unbounded)];
+        assert_eq!(scan_filtered("scan_skips_first_group", filters, 65_536), (4_464, 1));
+    }
+
+    #[test]
+    fn scan_skips_every_group() {
+        let filters = vec![int_range(Bound::Included(70_000), Bound::Unbounded)];
+        assert_eq!(scan_filtered("scan_skips_every_group", filters, 0), (0, 2));
+    }
+
+    #[test]
+    fn scan_without_filters_reads_every_group() {
+        assert_eq!(scan_filtered("scan_without_filters", Vec::new(), 0), (70_000, 0));
     }
 
     #[test]
