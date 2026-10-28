@@ -6,6 +6,7 @@ mod storage;
 use std::collections::HashMap;
 use std::fs;
 use std::hint::black_box;
+use std::ops::Bound;
 use std::time::Instant;
 
 use sqlparser::ast::{LimitClause, SelectItem, SetExpr, Statement, TableFactor};
@@ -13,7 +14,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::Catalog;
-use crate::exec::exec::{Bitmap, Operator, Scan, TableSource, Vector, VectorData};
+use crate::exec::exec::{
+    Bitmap, ColumnRange, Operator, Scalar, Scan, TableSource, Vector, VectorData,
+};
 use crate::storage::csv::{CsvTable, load_csv};
 use crate::storage::pax::{self, PaxFile};
 
@@ -83,17 +86,43 @@ fn main() {
 
         let csv = bench::measure(&format!("csv {label}"), 3, rows, csv_bytes, || {
             let source = CsvTable::load(&csv_path, schema);
-            drain(Scan::new(Box::new(source), scan_columns.clone(), Vec::new())).unwrap()
+            drain(Scan::new(
+                Box::new(source),
+                scan_columns.clone(),
+                Vec::new(),
+            ))
+            .unwrap()
         });
         let pax = bench::measure(&format!("pax {label}"), 10, rows, pax_bytes, || {
             let source = PaxFile::open(&pax_path).unwrap();
-            drain(Scan::new(Box::new(source), scan_columns.clone(), Vec::new())).unwrap()
+            drain(Scan::new(
+                Box::new(source),
+                scan_columns.clone(),
+                Vec::new(),
+            ))
+            .unwrap()
         });
         assert_eq!(
             csv, pax,
             "{label}: CSV and PAX scanned different row counts"
         );
     }
+
+    // Getting a feel of skipped groups for filter push down
+    let filter = vec![ColumnRange {
+        column: 0,
+        low: Bound::Included(Scalar::I64(1)),
+        high: Bound::Included(Scalar::I64(3)),
+    }];
+    let mut scan = Scan::new(Box::new(PaxFile::open(&pax_path).unwrap()), vec![0], filter);
+    let mut rows = 0;
+    while let Some(chunk) = scan.next().unwrap() {
+        rows += chunk.count;
+    }
+    println!(
+        "pushdown l_orderkey 1..=3: {rows} rows read, {} groups skipped",
+        scan.skipped_groups()
+    );
 }
 
 // Scans `columns` (e.g. "8,9") of the PAX file `runs` times (default 20) and prints the timing.

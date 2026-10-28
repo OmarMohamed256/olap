@@ -6,6 +6,7 @@ use crate::{
     exec::exec::{Bitmap, ColumnRange, Scalar, StringVector, TableSource, Vector, VectorData},
 };
 use std::cmp::Ordering;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write}; // traits that add read_exact, seek and write_all to File
 use std::ops::Bound;
@@ -379,6 +380,12 @@ impl PaxFooter {
     }
 }
 
+#[repr(u8)]
+pub enum EncodingTag {
+    Plain = 0,
+    Dictionary = 1,
+}
+
 // How execution types map to the file layout:
 //   row group      (all columns, up to 65,536 rows) -> split into 32 DataChunks when scanned
 //   column chunk   (one column of a row group)      -> one Vector: values + validity
@@ -415,16 +422,71 @@ impl VectorData {
                     buffer.extend_from_slice(&val.to_le_bytes());
                 }
             }
-            VectorData::Varchar(v) => {
-                let offsets = v.offsets();
+            VectorData::Varchar(string_vector) => {
+                let mut codes_of: HashMap<&str, u32> = HashMap::new();
+                let offsets = string_vector.offsets();
                 let first = offsets[start];
                 let last = offsets[start + num_rows];
-                buffer.reserve(((num_rows + 1) * 4) + ((last - first) as usize));
-                for &o in &offsets[start..=start + num_rows] {
-                    buffer.extend_from_slice(&(o - first).to_le_bytes());
+                // Both sizes include the 1-byte tag.
+                // plain:      tag + (num_rows + 1) offsets + string bytes
+                // dictionary: tag + num_distinct (u32) + (num_distinct + 1) offsets
+                //             + distinct bytes + num_rows codes of code_width(num_distinct) bytes
+                let total_plain_bytes_len = 1 + (num_rows + 1) * 4 + (last - first) as usize;
+                let dict_bytes_len = |distinct: &StringVector, width: usize| {
+                    1 + 4 + (distinct.len() + 1) * 4 + distinct.data().len() + num_rows * width
+                };
+                let mut distinct_values = StringVector::new();
+                let mut codes: Vec<u32> = Vec::with_capacity(num_rows);
+                let mut use_plain = false;
+
+                for i in start..start + num_rows {
+                    let s = string_vector.get(i);
+                    match codes_of.entry(s) {
+                        Entry::Occupied(e) => codes.push(*e.get()),
+                        Entry::Vacant(e) => {
+                            let code = distinct_values.len() as u32;
+                            codes.push(code);
+                            e.insert(code);
+                            distinct_values.push(s);
+                            // Early exit: the code width is only known at the end, so assume the
+                            // smallest (1 byte). Even then the dictionary is too big, and it only
+                            // grows from here.
+                            if dict_bytes_len(&distinct_values, 1) >= total_plain_bytes_len {
+                                use_plain = true;
+                                break;
+                            }
+                        }
+                    }
                 }
-                let data = &v.data()[first as usize..last as usize];
-                buffer.extend_from_slice(data.as_bytes())
+                let width = code_width(distinct_values.len());
+                let total_dict_bytes_len = dict_bytes_len(&distinct_values, width);
+
+                if use_plain || total_dict_bytes_len >= total_plain_bytes_len {
+                    // plain normal encoding
+                    buffer.reserve(total_plain_bytes_len);
+                    buffer.push(EncodingTag::Plain as u8);
+                    for &o in &offsets[start..=start + num_rows] {
+                        buffer.extend_from_slice(&(o - first).to_le_bytes());
+                    }
+                    let data = &string_vector.data()[first as usize..last as usize];
+                    buffer.extend_from_slice(data.as_bytes())
+                } else {
+                    // dictionary encoding
+                    buffer.reserve(total_dict_bytes_len);
+                    buffer.push(EncodingTag::Dictionary as u8);
+                    // num_distinct = values, not offsets; the reader reads num_distinct + 1 offsets.
+                    buffer.extend_from_slice(&(distinct_values.len() as u32).to_le_bytes());
+
+                    for &o in distinct_values.offsets() {
+                        buffer.extend_from_slice(&o.to_le_bytes());
+                    }
+                    buffer.extend_from_slice(distinct_values.data().as_bytes());
+
+                    // codes, each `width` bytes: the low bytes of the u32, little endian
+                    for code in codes {
+                        buffer.extend_from_slice(&code.to_le_bytes()[..width]);
+                    }
+                }
             }
         }
     }
@@ -455,39 +517,131 @@ impl VectorData {
                 Ok(VectorData::Date(values))
             }
             DataType::Varchar => {
-                // 1. Offsets: num_rows + 1 of them; string i is data[offsets[i]..offsets[i + 1]]
-                let offset_bytes = take_bytes(
-                    buffer,
-                    4 * (num_rows + 1),
-                    "Unexpected end reading string offsets",
-                )?;
-                // ALLOC: one 256 KB Vec<u32> per chunk (same size as on disk); it moves into the
-                // StringVector, no conversion and no per-row allocation.
-                let mut offsets: Vec<u32> = Vec::with_capacity(num_rows + 1);
-                for piece in offset_bytes.chunks_exact(4) {
-                    offsets.push(u32::from_le_bytes(piece.try_into().unwrap()));
+                // The first byte says which layout follows (EncodingTag).
+                let encoding_tag = take_bytes(buffer, 1, "Unexpected end reading encoding tag")?[0];
+                match encoding_tag {
+                    0 => {
+                        // Plain
+                        // 1. Offsets: num_rows + 1 of them; string i is data[offsets[i]..offsets[i + 1]]
+                        let offset_bytes = take_bytes(
+                            buffer,
+                            4 * (num_rows + 1),
+                            "Unexpected end reading string offsets",
+                        )?;
+                        // ALLOC: one 256 KB Vec<u32> per chunk (same size as on disk); it moves into the
+                        // StringVector, no conversion and no per-row allocation.
+                        let mut offsets: Vec<u32> = Vec::with_capacity(num_rows + 1);
+                        for piece in offset_bytes.chunks_exact(4) {
+                            offsets.push(u32::from_le_bytes(piece.try_into().unwrap()));
+                        }
+
+                        // 2. Data area: the last offset is its total length. Not checked yet: a huge value
+                        // makes take_bytes fail, a wrong small one is caught by from_parts below.
+                        let data_len = offsets[num_rows];
+                        let data = take_bytes(
+                            buffer,
+                            data_len as usize,
+                            "Unexpected end reading string data",
+                        )?;
+
+                        // 3. Check UTF-8 once for the whole data area, then copy it into one String.
+                        // ALLOC: one String of data_len bytes per chunk, instead of one per row.
+                        let text = std::str::from_utf8(data)
+                            .map_err(|_| "Invalid UTF-8 in string value".to_string())?
+                            .to_string();
+
+                        // 4. from_parts checks the offsets (start at 0, never decrease, end at data_len,
+                        // on character boundaries) and returns Err on corrupt data instead of panicking.
+                        Ok(VectorData::Varchar(StringVector::from_parts(
+                            offsets, text,
+                        )?))
+                    }
+                    1 => {
+                        // Dictionary: num_distinct, the distinct values (same layout as plain),
+                        // then one code per row of code_width(num_distinct) bytes.
+                        let num_distinct_bytes =
+                            take_bytes(buffer, 4, "Unexpected end reading num of distinct")?;
+                        let num_distinct =
+                            u32::from_le_bytes(num_distinct_bytes.try_into().unwrap());
+                        let mut distinct_offsets: Vec<u32> =
+                            Vec::with_capacity(num_distinct as usize + 1);
+                        let distinct_offsets_bytes = take_bytes(
+                            buffer,
+                            4 * (num_distinct as usize + 1),
+                            "Unexpected end reading distinct offsets",
+                        )?;
+                        for piece in distinct_offsets_bytes.chunks_exact(4) {
+                            distinct_offsets.push(u32::from_le_bytes(piece.try_into().unwrap()));
+                        }
+                        let data_len = distinct_offsets[num_distinct as usize];
+                        let data = take_bytes(
+                            buffer,
+                            data_len as usize,
+                            "Unexpected end reading string data",
+                        )?;
+
+                        let dict_text = std::str::from_utf8(data)
+                            .map_err(|_| "Invalid UTF-8 in string value".to_string())?
+                            .to_string();
+
+                        let distinct_values =
+                            StringVector::from_parts(distinct_offsets, dict_text)?;
+
+                        // The code width isn't stored: it follows from num_distinct.
+                        let width = code_width(num_distinct as usize);
+                        let codes_bytes =
+                            take_bytes(buffer, num_rows * width, "Unexpected end reading codes")?;
+                        // ALLOC: one Vec<u32> of codes per chunk. Matching on the width once,
+                        // outside the loop, keeps each loop a fixed-size read.
+                        let codes: Vec<u32> = match width {
+                            1 => codes_bytes.iter().map(|&b| b as u32).collect(),
+                            2 => codes_bytes
+                                .chunks_exact(2)
+                                .map(|p| u16::from_le_bytes(p.try_into().unwrap()) as u32)
+                                .collect(),
+                            _ => codes_bytes
+                                .chunks_exact(4)
+                                .map(|p| u32::from_le_bytes(p.try_into().unwrap()))
+                                .collect(),
+                        };
+
+                        // Pass 1: check every code and build the output offsets.
+                        // A code past the distinct values would index out of bounds.
+                        let distinct_offsets = distinct_values.offsets();
+                        let mut offsets: Vec<u32> = Vec::with_capacity(num_rows + 1);
+                        let mut end: usize = 0;
+                        offsets.push(0);
+                        for &code in &codes {
+                            let code = code as usize;
+                            if code >= distinct_values.len() {
+                                return Err(format!(
+                                    "Corrupted data: code {code} but only {num_distinct} distinct values"
+                                ));
+                            }
+                            end += (distinct_offsets[code + 1] - distinct_offsets[code]) as usize;
+                            offsets.push(u32::try_from(end).map_err(|_| {
+                                "Corrupted data: decoded strings exceed 4 GB".to_string()
+                            })?);
+                        }
+
+                        // Pass 2: copy each row's bytes out of the distinct values. Bytes, not
+                        // &str: slicing a &str checks character boundaries on every row.
+                        // ALLOC: one buffer of exactly `end` bytes per chunk.
+                        let distinct_bytes = distinct_values.data().as_bytes();
+                        let mut data: Vec<u8> = Vec::with_capacity(end);
+                        for &code in &codes {
+                            let code = code as usize;
+                            let range = distinct_offsets[code] as usize..distinct_offsets[code + 1] as usize;
+                            data.extend_from_slice(&distinct_bytes[range]);
+                        }
+                        // Pieces of valid UTF-8 joined at their boundaries stay valid, but checking
+                        // is one fast pass and keeps this safe.
+                        let text = String::from_utf8(data)
+                            .map_err(|_| "Invalid UTF-8 in string value".to_string())?;
+                        Ok(VectorData::Varchar(StringVector::from_parts(offsets, text)?))
+                    }
+                    tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
-
-                // 2. Data area: the last offset is its total length. Not checked yet: a huge value
-                // makes take_bytes fail, a wrong small one is caught by from_parts below.
-                let data_len = offsets[num_rows];
-                let data = take_bytes(
-                    buffer,
-                    data_len as usize,
-                    "Unexpected end reading string data",
-                )?;
-
-                // 3. Check UTF-8 once for the whole data area, then copy it into one String.
-                // ALLOC: one String of data_len bytes per chunk, instead of one per row.
-                let text = std::str::from_utf8(data)
-                    .map_err(|_| "Invalid UTF-8 in string value".to_string())?
-                    .to_string();
-
-                // 4. from_parts checks the offsets (start at 0, never decrease, end at data_len,
-                // on character boundaries) and returns Err on corrupt data instead of panicking.
-                Ok(VectorData::Varchar(StringVector::from_parts(
-                    offsets, text,
-                )?))
             }
         }
     }
@@ -647,6 +801,18 @@ impl Vector {
         Ok(Vector { data, validity })
     }
 }
+// Bytes per dictionary code: the smallest of 1, 2 or 4 that can hold codes 0..num_distinct.
+// A row group has at most 65,536 rows, so 4 is only reached by encode() on a bigger Vector.
+fn code_width(num_distinct: usize) -> usize {
+    if num_distinct <= 1 << 8 {
+        1
+    } else if num_distinct <= 1 << 16 {
+        2
+    } else {
+        4
+    }
+}
+
 fn take_bytes<'a>(buffer: &mut &'a [u8], len: usize, err_msg: &str) -> Result<&'a [u8], String> {
     if buffer.len() < len {
         return Err(err_msg.to_string());
@@ -1283,13 +1449,113 @@ mod tests {
         let values = VectorData::Varchar(StringVector::from_strs(&["AIR", "", "TRUCK", "café"]));
         let mut buffer: Vec<u8> = Vec::new();
         values.encode(&mut buffer);
-        assert_eq!(buffer.len(), 5 * 4 + 13); // offsets [0, 3, 3, 8, 13] + 13 data bytes
+        assert_eq!(buffer[0], EncodingTag::Plain as u8); // all distinct: plain is smaller
+        assert_eq!(buffer.len(), 1 + 5 * 4 + 13); // tag, offsets [0, 3, 3, 8, 13], 13 data bytes
 
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 4).unwrap();
 
         assert_eq!(decoded, values);
         assert!(bytes.is_empty()); // data area consumed too, not just offsets
+    }
+
+    // The 8-row l_shipmode example, repeated 4 times: 32 rows, 4 distinct values, 1-byte codes.
+    // Plain 257 bytes, dictionary 73.
+    const SHIPMODES: [&str; 8] = ["AIR", "TRUCK", "AIR", "MAIL", "TRUCK", "AIR", "RAIL", "MAIL"];
+    const SHIPMODE_CODES: [u32; 8] = [0, 1, 0, 2, 1, 0, 3, 2];
+
+    fn shipmodes_x4() -> Vec<&'static str> {
+        SHIPMODES.repeat(4)
+    }
+
+    #[test]
+    fn encode_varchar_picks_plain_when_smaller() {
+        // All distinct: plain 37 bytes, dictionary 45 (the values plus a code per row).
+        let buffer = varchar_bytes(&["AIR", "TRUCK", "MAIL", "RAIL"]);
+        assert_eq!(buffer[0], EncodingTag::Plain as u8);
+    }
+
+    #[test]
+    fn encode_varchar_two_byte_codes() {
+        // 300 distinct values don't fit a 1-byte code: codes take 2 bytes.
+        let distinct: Vec<String> = (0..300).map(|i| format!("value_{i:03}")).collect();
+        let values: Vec<&str> = (0..3000).map(|i| distinct[i % 300].as_str()).collect();
+        let buffer = varchar_bytes(&values);
+        assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
+        assert_eq!(&buffer[1..5], &300u32.to_le_bytes());
+        // tag, num_distinct, 301 offsets, 300 × 9 bytes, 3000 × 2-byte codes
+        assert_eq!(buffer.len(), 1 + 4 + 301 * 4 + 2700 + 3000 * 2);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 3000).unwrap();
+        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values)));
+    }
+
+    #[test]
+    fn encode_varchar_dictionary_layout() {
+        let buffer = varchar_bytes(&shipmodes_x4());
+        let mut expected = vec![EncodingTag::Dictionary as u8];
+        expected.extend_from_slice(&4u32.to_le_bytes()); // num_distinct
+        for o in [0u32, 3, 8, 12, 16] {
+            expected.extend_from_slice(&o.to_le_bytes());
+        }
+        expected.extend_from_slice(b"AIRTRUCKMAILRAIL");
+        for code in SHIPMODE_CODES.repeat(4) {
+            expected.push(code as u8); // 4 distinct values: 1-byte codes
+        }
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_dictionary() {
+        let values = shipmodes_x4();
+        let buffer = varchar_bytes(&values);
+        assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 32).unwrap();
+        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values)));
+        assert!(bytes.is_empty()); // codes consumed too
+    }
+
+    #[test]
+    fn encode_range_varchar_dictionary_middle() {
+        // Rows 2..18 only, starting at AIR MAIL TRUCK... Codes restart at 0 for every chunk.
+        let values = shipmodes_x4();
+        let mut buffer = Vec::new();
+        VectorData::Varchar(StringVector::from_strs(&values)).encode_range(2, 16, &mut buffer);
+        assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
+        assert_eq!(&buffer[1..5], &4u32.to_le_bytes()); // num_distinct
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 16).unwrap();
+        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values[2..18])));
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_dictionary_bad_code() {
+        let mut buffer = varchar_bytes(&shipmodes_x4());
+        let last_code = buffer.len() - 1;
+        buffer[last_code] = 4; // only codes 0..=3 exist
+        let mut bytes: &[u8] = &buffer;
+        let err = VectorData::decode(&mut bytes, DataType::Varchar, 32).unwrap_err();
+        assert!(err.contains("code 4"), "{err}");
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_dictionary_truncated() {
+        let buffer = varchar_bytes(&shipmodes_x4());
+        // Cutting anywhere before the end must fail, never panic.
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(VectorData::decode(&mut bytes, DataType::Varchar, 32).is_err(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn decode_vectordata_varchar_unknown_tag() {
+        let mut buffer = varchar_bytes(&shipmodes_x4());
+        buffer[0] = 7;
+        let mut bytes: &[u8] = &buffer;
+        let err = VectorData::decode(&mut bytes, DataType::Varchar, 32).unwrap_err();
+        assert!(err.contains("unknown encoding tag 7"), "{err}");
     }
 
     #[test]
@@ -1305,7 +1571,7 @@ mod tests {
 
     #[test]
     fn decode_vectordata_varchar_zero_rows() {
-        let buffer = varchar_bytes(&[]); // just the single offset 0
+        let buffer = varchar_bytes(&[]); // just the tag and the single offset 0
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 0).unwrap();
         assert_eq!(decoded, VectorData::Varchar(StringVector::new()));
@@ -1327,24 +1593,24 @@ mod tests {
 
     #[test]
     fn decode_vectordata_varchar_bad_offsets() {
-        // offsets [0, 3, 8] + "AIRTRUCK"
+        // tag 0, offsets [0, 3, 8] + "AIRTRUCK"
         let mut first_not_zero = varchar_bytes(&["AIR", "TRUCK"]);
-        first_not_zero[0] = 1;
+        first_not_zero[1] = 1;
         let mut bytes: &[u8] = &first_not_zero;
         assert!(VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err());
 
         let mut decreasing = varchar_bytes(&["AIR", "TRUCK"]);
-        decreasing[4] = 9; // offsets become [0, 9, 8]
+        decreasing[5] = 9; // offsets become [0, 9, 8]
         let mut bytes: &[u8] = &decreasing;
         assert!(VectorData::decode(&mut bytes, DataType::Varchar, 2).is_err());
     }
 
     #[test]
     fn decode_vectordata_varchar_offset_inside_character() {
-        // offsets [0, 2, 2] + "é" (2 bytes: 0xC3 0xA9). The data stays valid UTF-8,
+        // tag 0, offsets [0, 2, 2] + "é" (2 bytes: 0xC3 0xA9). The data stays valid UTF-8,
         // but moving offset 1 to byte 1 cuts "é" in half: only the boundary check can catch it.
         let mut buffer = varchar_bytes(&["é", ""]);
-        buffer[4] = 1; // offsets become [0, 1, 2]
+        buffer[5] = 1; // offsets become [0, 1, 2]
         let mut bytes: &[u8] = &buffer;
         let err = VectorData::decode(&mut bytes, DataType::Varchar, 2).unwrap_err();
         assert!(err.contains("character boundary"), "{err}");
@@ -1353,7 +1619,7 @@ mod tests {
     #[test]
     fn decode_vectordata_varchar_invalid_utf8() {
         let mut buffer = varchar_bytes(&["AIR"]);
-        buffer[8] = 0xFF; // first data byte, after offsets [0, 3]
+        buffer[9] = 0xFF; // first data byte, after the tag and offsets [0, 3]
         let mut bytes: &[u8] = &buffer;
         assert!(VectorData::decode(&mut bytes, DataType::Varchar, 1).is_err());
     }
@@ -1438,7 +1704,7 @@ mod tests {
         let mut buffer: Vec<u8> = Vec::new();
         let null_count = vector.encode(&mut buffer);
         assert_eq!(null_count, 0);
-        assert_eq!(buffer.len(), 16 + 8); // no bitmap: 4 offsets, then 8 string bytes
+        assert_eq!(buffer.len(), 1 + 16 + 8); // no bitmap: tag, 4 offsets, then 8 string bytes
 
         let mut bytes: &[u8] = &buffer;
         let decoded = Vector::decode(&mut bytes, DataType::Varchar, 3, null_count).unwrap();
@@ -2013,7 +2279,11 @@ mod tests {
         let mut scan = Scan::new(Box::new(pax), vec![0], filters);
         let mut row = first_row;
         while let Some(chunk) = scan.next().unwrap() {
-            assert_eq!(chunk.columns[0], copy_rows(&columns[0], row, chunk.count), "row {row}");
+            assert_eq!(
+                chunk.columns[0],
+                copy_rows(&columns[0], row, chunk.count),
+                "row {row}"
+            );
             row += chunk.count;
         }
         (row - first_row, scan.skipped_groups())
@@ -2023,13 +2293,19 @@ mod tests {
     fn scan_skips_second_group() {
         // A skipped group after a read one must not hand out the read group's rows again.
         let filters = vec![int_range(Bound::Unbounded, Bound::Excluded(65_536))];
-        assert_eq!(scan_filtered("scan_skips_second_group", filters, 0), (65_536, 1));
+        assert_eq!(
+            scan_filtered("scan_skips_second_group", filters, 0),
+            (65_536, 1)
+        );
     }
 
     #[test]
     fn scan_skips_first_group() {
         let filters = vec![int_range(Bound::Included(65_536), Bound::Unbounded)];
-        assert_eq!(scan_filtered("scan_skips_first_group", filters, 65_536), (4_464, 1));
+        assert_eq!(
+            scan_filtered("scan_skips_first_group", filters, 65_536),
+            (4_464, 1)
+        );
     }
 
     #[test]
@@ -2040,7 +2316,10 @@ mod tests {
 
     #[test]
     fn scan_without_filters_reads_every_group() {
-        assert_eq!(scan_filtered("scan_without_filters", Vec::new(), 0), (70_000, 0));
+        assert_eq!(
+            scan_filtered("scan_without_filters", Vec::new(), 0),
+            (70_000, 0)
+        );
     }
 
     #[test]
