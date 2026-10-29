@@ -1,6 +1,7 @@
 const MAGIC: [u8; 4] = *b"PAX1";
 // Rows per row group: 32 DataChunks of 2048. A multiple of 64, so each group's bitmap starts on a word boundary.
 const ROW_GROUP_SIZE: usize = 65_536;
+
 use crate::{
     catalog::{Column, DataType, TableSchema},
     exec::exec::{Bitmap, ColumnRange, Scalar, StringVector, TableSource, Vector, VectorData},
@@ -384,6 +385,7 @@ impl PaxFooter {
 pub enum EncodingTag {
     Plain = 0,
     Dictionary = 1,
+    FrameOfReference = 2,
 }
 
 // How execution types map to the file layout:
@@ -403,9 +405,46 @@ impl VectorData {
         match self {
             VectorData::Int64(v) => {
                 let v = &v[range];
-                buffer.reserve(v.len() * 8);
-                for &val in v {
-                    buffer.extend_from_slice(&val.to_le_bytes());
+                // Frame of reference: store min once, then each value as (value - min) in bit_width bits.
+                // wrapping_sub as u64 gives the true distance even when it doesn't fit in an i64.
+                let min = v.iter().copied().min().unwrap_or(0);
+                let max = v.iter().copied().max().unwrap_or(0);
+                let spread = max.wrapping_sub(min) as u64;
+                let bit_width = (u64::BITS - spread.leading_zeros()) as u8; // 0 when all values are equal
+
+                // tag + values as i64
+                let plain_byte_size = 1 + 8 * num_rows;
+                let packed_bits = num_rows * bit_width as usize;
+                // tag + min + bit_width + packed deltas
+                let frame_of_reference_byte_size = 1 + 8 + 1 + packed_bits.div_ceil(8);
+                if frame_of_reference_byte_size >= plain_byte_size {
+                    buffer.reserve(plain_byte_size);
+                    buffer.push(EncodingTag::Plain as u8);
+                    for &val in v {
+                        buffer.extend_from_slice(&val.to_le_bytes());
+                    }
+                } else {
+                    buffer.reserve(frame_of_reference_byte_size);
+                    buffer.push(EncodingTag::FrameOfReference as u8);
+                    buffer.extend_from_slice(&min.to_le_bytes());
+                    buffer.push(bit_width);
+                    // u128: up to 7 waiting bits + a 64-bit delta = 71 bits.
+                    let mut acc: u128 = 0;
+                    let mut bits_in_acc: u32 = 0;
+                    for &val in v {
+                        let delta = val.wrapping_sub(min) as u64;
+                        acc |= (delta as u128) << bits_in_acc;
+                        bits_in_acc += bit_width as u32;
+                        while bits_in_acc >= 8 {
+                            buffer.push(acc as u8); // `as u8` keeps the low 8 bits
+                            acc >>= 8;
+                            bits_in_acc -= 8;
+                        }
+                    }
+                    // Last partial byte; its unused high bits are 0 padding.
+                    if bits_in_acc > 0 {
+                        buffer.push(acc as u8);
+                    }
                 }
             }
             VectorData::Float64(v) => {
@@ -493,12 +532,19 @@ impl VectorData {
     pub fn decode(buffer: &mut &[u8], ty: DataType, num_rows: usize) -> Result<Self, String> {
         match ty {
             DataType::Int64 => {
-                let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading i64 values")?;
-                let mut values = Vec::with_capacity(num_rows); // safe: take_bytes already proved the bytes exist
-                for piece in bytes.chunks_exact(8) {
-                    values.push(i64::from_le_bytes(piece.try_into().unwrap()));
+                let encoding_tag = take_bytes(buffer, 1, "Unexpected end reading encoding tag")?[0];
+                match encoding_tag {
+                    0 => {
+                        let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading i64 values")?;
+                        let mut values = Vec::with_capacity(num_rows); // safe: take_bytes already proved the bytes exist
+                        for piece in bytes.chunks_exact(8) {
+                            values.push(i64::from_le_bytes(piece.try_into().unwrap()));
+                        }
+                        Ok(VectorData::Int64(values))
+                    }
+                    // TODO: 2 => FrameOfReference
+                    tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
-                Ok(VectorData::Int64(values))
             }
             DataType::Float64 => {
                 let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading f64 values")?;
@@ -631,14 +677,17 @@ impl VectorData {
                         let mut data: Vec<u8> = Vec::with_capacity(end);
                         for &code in &codes {
                             let code = code as usize;
-                            let range = distinct_offsets[code] as usize..distinct_offsets[code + 1] as usize;
+                            let range = distinct_offsets[code] as usize
+                                ..distinct_offsets[code + 1] as usize;
                             data.extend_from_slice(&distinct_bytes[range]);
                         }
                         // Pieces of valid UTF-8 joined at their boundaries stay valid, but checking
                         // is one fast pass and keeps this safe.
                         let text = String::from_utf8(data)
                             .map_err(|_| "Invalid UTF-8 in string value".to_string())?;
-                        Ok(VectorData::Varchar(StringVector::from_parts(offsets, text)?))
+                        Ok(VectorData::Varchar(StringVector::from_parts(
+                            offsets, text,
+                        )?))
                     }
                     tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
@@ -1422,9 +1471,10 @@ mod tests {
         let mut buffer: Vec<u8> = Vec::new();
         VectorData::Int64(vec![1, 2, 3]).encode(&mut buffer);
 
-        // 24 bytes hold 3 values; asking for 4 must fail, not read past the end.
+        // FOR, 2 bits per value: 3 rows = 6 bits = 1 byte. A 4th row still fits in that
+        // byte's padding, so ask for 5 (10 bits, 2 bytes): must fail, not read past the end.
         let mut bytes: &[u8] = &buffer;
-        assert!(VectorData::decode(&mut bytes, DataType::Int64, 4).is_err());
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, 5).is_err());
     }
 
     #[test]
@@ -1459,9 +1509,94 @@ mod tests {
         assert!(bytes.is_empty()); // data area consumed too, not just offsets
     }
 
+    // The l_quantity example: min 8, deltas 9 28 0 20 16 24 30 37, 6 bits each.
+    const QUANTITIES: [i64; 8] = [17, 36, 8, 28, 24, 32, 38, 45];
+
+    fn int64_round_trip(values: &[i64]) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::new();
+        VectorData::Int64(values.to_vec()).encode(&mut buffer);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Int64, values.len()).unwrap();
+        assert_eq!(decoded, VectorData::Int64(values.to_vec()));
+        assert!(bytes.is_empty());
+        buffer
+    }
+
+    #[test]
+    fn encode_int64_for_layout() {
+        let buffer = int64_round_trip(&QUANTITIES);
+        let mut expected = vec![EncodingTag::FrameOfReference as u8];
+        expected.extend_from_slice(&8i64.to_le_bytes()); // min
+        expected.push(6); // bit_width
+        expected.extend_from_slice(&[0x09, 0x07, 0x50, 0x10, 0xE6, 0x95]);
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn encode_int64_for_padding() {
+        // QUANTITIES without 38: same min and width, 7 rows x 6 bits = 42 bits.
+        // The last byte holds 2 bits of the last delta (37) and 6 bits of padding.
+        let buffer = int64_round_trip(&[17, 36, 8, 28, 24, 32, 45]);
+        assert_eq!(buffer[9], 6);
+        assert_eq!(&buffer[10..], &[0x09, 0x07, 0x50, 0x10, 0x56, 0x02]);
+    }
+
+    #[test]
+    fn encode_int64_for_all_equal() {
+        // Spread 0 -> 0 bits: header only.
+        let buffer = int64_round_trip(&[5; 100]);
+        assert_eq!(buffer.len(), 1 + 8 + 1);
+        assert_eq!(buffer[9], 0);
+    }
+
+    #[test]
+    fn encode_int64_for_negatives() {
+        let buffer = int64_round_trip(&[-5, -1, -100, 3, -7]);
+        assert_eq!(buffer[0], EncodingTag::FrameOfReference as u8);
+        assert_eq!(&buffer[1..9], &(-100i64).to_le_bytes()); // min
+        assert_eq!(buffer[9], 7); // spread 103
+    }
+
+    #[test]
+    fn encode_int64_extremes_pick_plain() {
+        // Spread doesn't fit in an i64 (wrapping_sub); 64 bits per value is never smaller than plain.
+        let buffer = int64_round_trip(&[i64::MIN, 0, i64::MAX]);
+        assert_eq!(buffer[0], EncodingTag::Plain as u8);
+        assert_eq!(buffer.len(), 1 + 3 * 8);
+    }
+
+    #[test]
+    fn encode_int64_wide_for() {
+        // 63-bit deltas: the accumulator holds up to 7 + 63 bits, more than a u64.
+        // 100 rows so the 1 bit saved per row beats the 9 extra header bytes.
+        let values: Vec<i64> = (0..100).map(|i| if i % 2 == 0 { 0 } else { i64::MAX - i }).collect();
+        let buffer = int64_round_trip(&values);
+        assert_eq!(buffer[0], EncodingTag::FrameOfReference as u8);
+        assert_eq!(buffer[9], 63);
+    }
+
+    #[test]
+    fn decode_int64_for_bad_bit_width() {
+        let mut buffer = int64_round_trip(&QUANTITIES);
+        buffer[9] = 65;
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, 8).is_err());
+    }
+
+    #[test]
+    fn decode_int64_for_truncated() {
+        let buffer = int64_round_trip(&QUANTITIES);
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(VectorData::decode(&mut bytes, DataType::Int64, 8).is_err(), "len {len}");
+        }
+    }
+
     // The 8-row l_shipmode example, repeated 4 times: 32 rows, 4 distinct values, 1-byte codes.
     // Plain 257 bytes, dictionary 73.
-    const SHIPMODES: [&str; 8] = ["AIR", "TRUCK", "AIR", "MAIL", "TRUCK", "AIR", "RAIL", "MAIL"];
+    const SHIPMODES: [&str; 8] = [
+        "AIR", "TRUCK", "AIR", "MAIL", "TRUCK", "AIR", "RAIL", "MAIL",
+    ];
     const SHIPMODE_CODES: [u32; 8] = [0, 1, 0, 2, 1, 0, 3, 2];
 
     fn shipmodes_x4() -> Vec<&'static str> {
@@ -1487,7 +1622,10 @@ mod tests {
         assert_eq!(buffer.len(), 1 + 4 + 301 * 4 + 2700 + 3000 * 2);
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 3000).unwrap();
-        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values)));
+        assert_eq!(
+            decoded,
+            VectorData::Varchar(StringVector::from_strs(&values))
+        );
     }
 
     #[test]
@@ -1512,7 +1650,10 @@ mod tests {
         assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 32).unwrap();
-        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values)));
+        assert_eq!(
+            decoded,
+            VectorData::Varchar(StringVector::from_strs(&values))
+        );
         assert!(bytes.is_empty()); // codes consumed too
     }
 
@@ -1526,7 +1667,10 @@ mod tests {
         assert_eq!(&buffer[1..5], &4u32.to_le_bytes()); // num_distinct
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 16).unwrap();
-        assert_eq!(decoded, VectorData::Varchar(StringVector::from_strs(&values[2..18])));
+        assert_eq!(
+            decoded,
+            VectorData::Varchar(StringVector::from_strs(&values[2..18]))
+        );
     }
 
     #[test]
@@ -1545,7 +1689,10 @@ mod tests {
         // Cutting anywhere before the end must fail, never panic.
         for len in 0..buffer.len() {
             let mut bytes: &[u8] = &buffer[..len];
-            assert!(VectorData::decode(&mut bytes, DataType::Varchar, 32).is_err(), "len {len}");
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Varchar, 32).is_err(),
+                "len {len}"
+            );
         }
     }
 
@@ -1687,7 +1834,8 @@ mod tests {
         let mut buffer: Vec<u8> = Vec::new();
         let null_count = vector.encode(&mut buffer);
         assert_eq!(null_count, 3);
-        assert_eq!(buffer.len(), 16 + 800); // 2 bitmap words, then 100 values
+        // 2 bitmap words, then FOR: values 0..=98 -> 7 bits each, 700 bits = 88 bytes.
+        assert_eq!(buffer.len(), 16 + 1 + 8 + 1 + 88);
 
         let mut bytes: &[u8] = &buffer;
         let decoded = Vector::decode(&mut bytes, DataType::Int64, 100, null_count).unwrap();
@@ -1784,7 +1932,8 @@ mod tests {
         // Rows 0..64 hold only the NULL at row 3; rows 128..148 hold none.
         let mut buffer: Vec<u8> = Vec::new();
         assert_eq!(vector.encode_range(128, 20, &mut buffer), 0);
-        assert_eq!(buffer.len(), 20 * 8); // values only
+        // Values only, FOR: 128..=147 -> 5 bits each, 100 bits = 13 bytes.
+        assert_eq!(buffer.len(), 1 + 8 + 1 + 13);
     }
 
     #[test]
@@ -1952,8 +2101,9 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1].num_rows, 4_464);
         let chunk = &groups[1].chunks_metadata[0];
-        assert_eq!(chunk.offset, 4 + 65_536 * 8); // right after group 0
-        assert_eq!(chunk.chunk_length, 4_464 * 8);
+        // FOR: group 0 holds 0..=65,535 -> 16 bits; group 1 holds a spread of 4,463 -> 13 bits.
+        assert_eq!(chunk.offset, 4 + 1 + 8 + 1 + 65_536 * 2); // right after group 0
+        assert_eq!(chunk.chunk_length, 1 + 8 + 1 + (4_464 * 13usize).div_ceil(8) as u32);
         assert_eq!(
             chunk.zone_map,
             Some(ZoneMap {
