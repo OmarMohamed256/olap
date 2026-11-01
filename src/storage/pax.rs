@@ -535,14 +535,48 @@ impl VectorData {
                 let encoding_tag = take_bytes(buffer, 1, "Unexpected end reading encoding tag")?[0];
                 match encoding_tag {
                     0 => {
-                        let bytes = take_bytes(buffer, 8 * num_rows, "Unexpected end reading i64 values")?;
+                        let bytes =
+                            take_bytes(buffer, 8 * num_rows, "Unexpected end reading i64 values")?;
                         let mut values = Vec::with_capacity(num_rows); // safe: take_bytes already proved the bytes exist
                         for piece in bytes.chunks_exact(8) {
                             values.push(i64::from_le_bytes(piece.try_into().unwrap()));
                         }
                         Ok(VectorData::Int64(values))
                     }
-                    // TODO: 2 => FrameOfReference
+                    2 => {
+                        // Frame of reference: min, bit_width, then num_rows deltas packed back to back.
+                        let min_bytes = take_bytes(buffer, 8, "Unexpected end reading FOR min")?;
+                        let min = i64::from_le_bytes(min_bytes.try_into().unwrap());
+                        let bit_width =
+                            take_bytes(buffer, 1, "Unexpected end reading FOR bit width")?[0]
+                                as u32;
+                        if bit_width > 64 {
+                            return Err(format!("Corrupted data: FOR bit width {bit_width} > 64"));
+                        }
+                        let packed = take_bytes(
+                            buffer,
+                            (num_rows * bit_width as usize).div_ceil(8),
+                            "Unexpected end reading packed values",
+                        )?;
+                        let mask = (1_u128 << bit_width) - 1; // u128, so bit_width = 64 doesn't overflow
+                        let mut values = Vec::with_capacity(num_rows);
+                        let mut acc: u128 = 0;
+                        let mut bits_in_acc: u32 = 0;
+                        let mut iter = packed.iter();
+                        // One value per row; padding bits after the last row are never read.
+                        for _ in 0..num_rows {
+                            while bits_in_acc < bit_width {
+                                // take_bytes proved packed covers num_rows * bit_width bits
+                                acc |= (*iter.next().unwrap() as u128) << bits_in_acc;
+                                bits_in_acc += 8;
+                            }
+                            let delta = (acc & mask) as u64;
+                            acc >>= bit_width;
+                            bits_in_acc -= bit_width;
+                            values.push(min.wrapping_add(delta as i64));
+                        }
+                        Ok(VectorData::Int64(values))
+                    }
                     tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
             }
@@ -1569,7 +1603,9 @@ mod tests {
     fn encode_int64_wide_for() {
         // 63-bit deltas: the accumulator holds up to 7 + 63 bits, more than a u64.
         // 100 rows so the 1 bit saved per row beats the 9 extra header bytes.
-        let values: Vec<i64> = (0..100).map(|i| if i % 2 == 0 { 0 } else { i64::MAX - i }).collect();
+        let values: Vec<i64> = (0..100)
+            .map(|i| if i % 2 == 0 { 0 } else { i64::MAX - i })
+            .collect();
         let buffer = int64_round_trip(&values);
         assert_eq!(buffer[0], EncodingTag::FrameOfReference as u8);
         assert_eq!(buffer[9], 63);
@@ -1588,7 +1624,10 @@ mod tests {
         let buffer = int64_round_trip(&QUANTITIES);
         for len in 0..buffer.len() {
             let mut bytes: &[u8] = &buffer[..len];
-            assert!(VectorData::decode(&mut bytes, DataType::Int64, 8).is_err(), "len {len}");
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Int64, 8).is_err(),
+                "len {len}"
+            );
         }
     }
 
@@ -2103,7 +2142,10 @@ mod tests {
         let chunk = &groups[1].chunks_metadata[0];
         // FOR: group 0 holds 0..=65,535 -> 16 bits; group 1 holds a spread of 4,463 -> 13 bits.
         assert_eq!(chunk.offset, 4 + 1 + 8 + 1 + 65_536 * 2); // right after group 0
-        assert_eq!(chunk.chunk_length, 1 + 8 + 1 + (4_464 * 13usize).div_ceil(8) as u32);
+        assert_eq!(
+            chunk.chunk_length,
+            1 + 8 + 1 + (4_464 * 13usize).div_ceil(8) as u32
+        );
         assert_eq!(
             chunk.zone_map,
             Some(ZoneMap {
