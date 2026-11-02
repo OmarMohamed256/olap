@@ -410,7 +410,7 @@ impl VectorData {
                 let min = v.iter().copied().min().unwrap_or(0);
                 let max = v.iter().copied().max().unwrap_or(0);
                 let spread = max.wrapping_sub(min) as u64;
-                let bit_width = (u64::BITS - spread.leading_zeros()) as u8; // 0 when all values are equal
+                let bit_width = bit_width(spread);
 
                 // tag + values as i64
                 let plain_byte_size = 1 + 8 * num_rows;
@@ -448,7 +448,7 @@ impl VectorData {
                 let min = v.iter().copied().min().unwrap_or(0);
                 let max = v.iter().copied().max().unwrap_or(0);
                 let spread = max.wrapping_sub(min) as u32;
-                let bit_width = (u32::BITS - spread.leading_zeros()) as u8;
+                let bit_width = bit_width(spread as u64);
 
                 // tag + values as i32
                 let plain_byte_size = 1 + 4 * num_rows;
@@ -482,10 +482,13 @@ impl VectorData {
                 // Both sizes include the 1-byte tag.
                 // plain:      tag + (num_rows + 1) offsets + string bytes
                 // dictionary: tag + num_distinct (u32) + (num_distinct + 1) offsets
-                //             + distinct bytes + num_rows codes of code_width(num_distinct) bytes
+                //             + distinct bytes + num_rows codes packed in bit_width(num_distinct - 1) bits
                 let total_plain_bytes_len = 1 + (num_rows + 1) * 4 + (last - first) as usize;
-                let dict_bytes_len = |distinct: &StringVector, width: usize| {
-                    1 + 4 + (distinct.len() + 1) * 4 + distinct.data().len() + num_rows * width
+                let dict_bytes_len = |distinct: &StringVector, bit_width: usize| {
+                    1 + 4
+                        + (distinct.len() + 1) * 4
+                        + distinct.data().len()
+                        + (num_rows * bit_width).div_ceil(8)
                 };
                 let mut distinct_values = StringVector::new();
                 let mut codes: Vec<u32> = Vec::with_capacity(num_rows);
@@ -500,18 +503,22 @@ impl VectorData {
                             codes.push(code);
                             e.insert(code);
                             distinct_values.push(s);
-                            // Early exit: the code width is only known at the end, so assume the
-                            // smallest (1 byte). Even then the dictionary is too big, and it only
-                            // grows from here.
-                            if dict_bytes_len(&distinct_values, 1) >= total_plain_bytes_len {
+                            // Early exit: the distinct count only grows, and so does the code bit width.
+                            // If the dictionary is too big at the current count, it can't win.
+                            if dict_bytes_len(
+                                &distinct_values,
+                                bit_width((distinct_values.len() - 1) as u64) as usize,
+                            ) >= total_plain_bytes_len
+                            {
                                 use_plain = true;
                                 break;
                             }
                         }
                     }
                 }
-                let width = code_width(distinct_values.len());
-                let total_dict_bytes_len = dict_bytes_len(&distinct_values, width);
+                // saturating_sub: 0 rows leave no distinct values, and 0 - 1 would underflow.
+                let bit_width = bit_width(distinct_values.len().saturating_sub(1) as u64);
+                let total_dict_bytes_len = dict_bytes_len(&distinct_values, bit_width as usize);
 
                 if use_plain || total_dict_bytes_len >= total_plain_bytes_len {
                     // plain normal encoding
@@ -526,6 +533,7 @@ impl VectorData {
                     // dictionary encoding
                     buffer.reserve(total_dict_bytes_len);
                     buffer.push(EncodingTag::Dictionary as u8);
+
                     // num_distinct = values, not offsets; the reader reads num_distinct + 1 offsets.
                     buffer.extend_from_slice(&(distinct_values.len() as u32).to_le_bytes());
 
@@ -534,10 +542,7 @@ impl VectorData {
                     }
                     buffer.extend_from_slice(distinct_values.data().as_bytes());
 
-                    // codes, each `width` bytes: the low bytes of the u32, little endian
-                    for code in codes {
-                        buffer.extend_from_slice(&code.to_le_bytes()[..width]);
-                    }
+                    pack(codes.iter().map(|&x| x as u64), bit_width, buffer);
                 }
             }
         }
@@ -650,7 +655,6 @@ impl VectorData {
                     }
                     1 => {
                         // Dictionary: num_distinct, the distinct values (same layout as plain),
-                        // then one code per row of code_width(num_distinct) bytes.
                         let num_distinct_bytes =
                             take_bytes(buffer, 4, "Unexpected end reading num of distinct")?;
                         let num_distinct =
@@ -678,24 +682,10 @@ impl VectorData {
 
                         let distinct_values =
                             StringVector::from_parts(distinct_offsets, dict_text)?;
-
-                        // The code width isn't stored: it follows from num_distinct.
-                        let width = code_width(num_distinct as usize);
-                        let codes_bytes =
-                            take_bytes(buffer, num_rows * width, "Unexpected end reading codes")?;
-                        // ALLOC: one Vec<u32> of codes per chunk. Matching on the width once,
-                        // outside the loop, keeps each loop a fixed-size read.
-                        let codes: Vec<u32> = match width {
-                            1 => codes_bytes.iter().map(|&b| b as u32).collect(),
-                            2 => codes_bytes
-                                .chunks_exact(2)
-                                .map(|p| u16::from_le_bytes(p.try_into().unwrap()) as u32)
-                                .collect(),
-                            _ => codes_bytes
-                                .chunks_exact(4)
-                                .map(|p| u32::from_le_bytes(p.try_into().unwrap()))
-                                .collect(),
-                        };
+                        let bit_width = bit_width(distinct_values.len().saturating_sub(1) as u64);
+                        let codes: Vec<u32> = BitUnpacker::new(buffer, num_rows, bit_width as u32)?
+                            .map(|code| code as u32)
+                            .collect();
 
                         // Pass 1: check every code and build the output offsets.
                         // A code past the distinct values would index out of bounds.
@@ -976,16 +966,10 @@ impl Vector {
         Ok(Vector { data, validity })
     }
 }
-// Bytes per dictionary code: the smallest of 1, 2 or 4 that can hold codes 0..num_distinct.
-// A row group has at most 65,536 rows, so 4 is only reached by encode() on a bigger Vector.
-fn code_width(num_distinct: usize) -> usize {
-    if num_distinct <= 1 << 8 {
-        1
-    } else if num_distinct <= 1 << 16 {
-        2
-    } else {
-        4
-    }
+
+// Bits needed to hold every value up to max_value; 0 when max_value is 0.
+fn bit_width(max_value: u64) -> u8 {
+    (u64::BITS - max_value.leading_zeros()) as u8
 }
 
 fn take_bytes<'a>(buffer: &mut &'a [u8], len: usize, err_msg: &str) -> Result<&'a [u8], String> {
@@ -1796,8 +1780,8 @@ mod tests {
         }
     }
 
-    // The 8-row l_shipmode example, repeated 4 times: 32 rows, 4 distinct values, 1-byte codes.
-    // Plain 257 bytes, dictionary 73.
+    // The 8-row l_shipmode example, repeated 4 times: 32 rows, 4 distinct values, 2-bit codes.
+    // Plain 257 bytes, dictionary 49.
     const SHIPMODES: [&str; 8] = [
         "AIR", "TRUCK", "AIR", "MAIL", "TRUCK", "AIR", "RAIL", "MAIL",
     ];
@@ -1809,21 +1793,24 @@ mod tests {
 
     #[test]
     fn encode_varchar_picks_plain_when_smaller() {
-        // All distinct: plain 37 bytes, dictionary 45 (the values plus a code per row).
+        // All distinct: plain 37 bytes, dictionary 42 (the values plus a 2-bit code per row).
         let buffer = varchar_bytes(&["AIR", "TRUCK", "MAIL", "RAIL"]);
         assert_eq!(buffer[0], EncodingTag::Plain as u8);
     }
 
     #[test]
-    fn encode_varchar_two_byte_codes() {
-        // 300 distinct values don't fit a 1-byte code: codes take 2 bytes.
+    fn encode_varchar_nine_bit_codes() {
+        // 300 distinct values: the largest code, 299, needs 9 bits.
         let distinct: Vec<String> = (0..300).map(|i| format!("value_{i:03}")).collect();
         let values: Vec<&str> = (0..3000).map(|i| distinct[i % 300].as_str()).collect();
         let buffer = varchar_bytes(&values);
         assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
         assert_eq!(&buffer[1..5], &300u32.to_le_bytes());
-        // tag, num_distinct, 301 offsets, 300 × 9 bytes, 3000 × 2-byte codes
-        assert_eq!(buffer.len(), 1 + 4 + 301 * 4 + 2700 + 3000 * 2);
+        // tag, num_distinct, 301 offsets, 300 × 9 bytes, 3000 × 9-bit codes
+        assert_eq!(
+            buffer.len(),
+            1 + 4 + 301 * 4 + 2700 + (3000 * 9usize).div_ceil(8)
+        );
         let mut bytes: &[u8] = &buffer;
         let decoded = VectorData::decode(&mut bytes, DataType::Varchar, 3000).unwrap();
         assert_eq!(
@@ -1841,9 +1828,10 @@ mod tests {
             expected.extend_from_slice(&o.to_le_bytes());
         }
         expected.extend_from_slice(b"AIRTRUCKMAILRAIL");
-        for code in SHIPMODE_CODES.repeat(4) {
-            expected.push(code as u8); // 4 distinct values: 1-byte codes
-        }
+        // 4 distinct values: 2-bit codes, four per byte, low bits first.
+        // 0,1,0,2 -> 10 00 01 00 = 0x84; 1,0,3,2 -> 10 11 00 01 = 0xB1
+        assert_eq!(SHIPMODE_CODES, [0, 1, 0, 2, 1, 0, 3, 2]);
+        expected.extend_from_slice(&[0x84, 0xB1].repeat(4));
         assert_eq!(buffer, expected);
     }
 
@@ -1879,12 +1867,16 @@ mod tests {
 
     #[test]
     fn decode_vectordata_varchar_dictionary_bad_code() {
-        let mut buffer = varchar_bytes(&shipmodes_x4());
-        let last_code = buffer.len() - 1;
-        buffer[last_code] = 4; // only codes 0..=3 exist
+        // 3 distinct values: 2-bit codes, so 3 fits in the bits but has no value.
+        // With 4 distinct values every 2-bit pattern would be a valid code.
+        let values = ["AIR", "TRUCK", "MAIL"].repeat(8);
+        let mut buffer = varchar_bytes(&values);
+        assert_eq!(buffer[0], EncodingTag::Dictionary as u8);
+        let last_byte = buffer.len() - 1;
+        buffer[last_byte] = 0xFF; // the last four codes become 3
         let mut bytes: &[u8] = &buffer;
-        let err = VectorData::decode(&mut bytes, DataType::Varchar, 32).unwrap_err();
-        assert!(err.contains("code 4"), "{err}");
+        let err = VectorData::decode(&mut bytes, DataType::Varchar, 24).unwrap_err();
+        assert!(err.contains("code 3"), "{err}");
     }
 
     #[test]
