@@ -428,23 +428,11 @@ impl VectorData {
                     buffer.push(EncodingTag::FrameOfReference as u8);
                     buffer.extend_from_slice(&min.to_le_bytes());
                     buffer.push(bit_width);
-                    // u128: up to 7 waiting bits + a 64-bit delta = 71 bits.
-                    let mut acc: u128 = 0;
-                    let mut bits_in_acc: u32 = 0;
-                    for &val in v {
-                        let delta = val.wrapping_sub(min) as u64;
-                        acc |= (delta as u128) << bits_in_acc;
-                        bits_in_acc += bit_width as u32;
-                        while bits_in_acc >= 8 {
-                            buffer.push(acc as u8); // `as u8` keeps the low 8 bits
-                            acc >>= 8;
-                            bits_in_acc -= 8;
-                        }
-                    }
-                    // Last partial byte; its unused high bits are 0 padding.
-                    if bits_in_acc > 0 {
-                        buffer.push(acc as u8);
-                    }
+                    pack(
+                        v.iter().map(|&x| x.wrapping_sub(min) as u64),
+                        bit_width,
+                        buffer,
+                    );
                 }
             }
             VectorData::Float64(v) => {
@@ -456,9 +444,34 @@ impl VectorData {
             }
             VectorData::Date(v) => {
                 let v = &v[range];
-                buffer.reserve(v.len() * 4);
-                for &val in v {
-                    buffer.extend_from_slice(&val.to_le_bytes());
+                // Same frame of reference as Int64, with i32 values.
+                let min = v.iter().copied().min().unwrap_or(0);
+                let max = v.iter().copied().max().unwrap_or(0);
+                let spread = max.wrapping_sub(min) as u32;
+                let bit_width = (u32::BITS - spread.leading_zeros()) as u8;
+
+                // tag + values as i32
+                let plain_byte_size = 1 + 4 * num_rows;
+                let packed_bits = num_rows * bit_width as usize;
+                // tag + min + bit_width + packed deltas
+                let frame_of_reference_byte_size = 1 + 4 + 1 + packed_bits.div_ceil(8);
+                if frame_of_reference_byte_size >= plain_byte_size {
+                    buffer.reserve(plain_byte_size);
+                    buffer.push(EncodingTag::Plain as u8);
+                    for &val in v {
+                        buffer.extend_from_slice(&val.to_le_bytes());
+                    }
+                } else {
+                    buffer.reserve(frame_of_reference_byte_size);
+                    buffer.push(EncodingTag::FrameOfReference as u8);
+                    buffer.extend_from_slice(&min.to_le_bytes());
+                    buffer.push(bit_width);
+                    // Through u32: a negative i32 cast straight to u64 would sign-extend.
+                    pack(
+                        v.iter().map(|&x| x.wrapping_sub(min) as u32 as u64),
+                        bit_width,
+                        buffer,
+                    );
                 }
             }
             VectorData::Varchar(string_vector) => {
@@ -550,31 +563,9 @@ impl VectorData {
                         let bit_width =
                             take_bytes(buffer, 1, "Unexpected end reading FOR bit width")?[0]
                                 as u32;
-                        if bit_width > 64 {
-                            return Err(format!("Corrupted data: FOR bit width {bit_width} > 64"));
-                        }
-                        let packed = take_bytes(
-                            buffer,
-                            (num_rows * bit_width as usize).div_ceil(8),
-                            "Unexpected end reading packed values",
-                        )?;
-                        let mask = (1_u128 << bit_width) - 1; // u128, so bit_width = 64 doesn't overflow
-                        let mut values = Vec::with_capacity(num_rows);
-                        let mut acc: u128 = 0;
-                        let mut bits_in_acc: u32 = 0;
-                        let mut iter = packed.iter();
-                        // One value per row; padding bits after the last row are never read.
-                        for _ in 0..num_rows {
-                            while bits_in_acc < bit_width {
-                                // take_bytes proved packed covers num_rows * bit_width bits
-                                acc |= (*iter.next().unwrap() as u128) << bits_in_acc;
-                                bits_in_acc += 8;
-                            }
-                            let delta = (acc & mask) as u64;
-                            acc >>= bit_width;
-                            bits_in_acc -= bit_width;
-                            values.push(min.wrapping_add(delta as i64));
-                        }
+                        let values = BitUnpacker::new(buffer, num_rows, bit_width)?
+                            .map(|delta| min.wrapping_add(delta as i64))
+                            .collect();
                         Ok(VectorData::Int64(values))
                     }
                     tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
@@ -589,12 +580,33 @@ impl VectorData {
                 Ok(VectorData::Float64(values))
             }
             DataType::Date => {
-                let bytes = take_bytes(buffer, 4 * num_rows, "Unexpected end reading date values")?;
-                let mut values = Vec::with_capacity(num_rows);
-                for piece in bytes.chunks_exact(4) {
-                    values.push(i32::from_le_bytes(piece.try_into().unwrap()));
+                let encoding_tag = take_bytes(buffer, 1, "Unexpected end reading encoding tag")?[0];
+                match encoding_tag {
+                    0 => {
+                        let bytes =
+                            take_bytes(buffer, 4 * num_rows, "Unexpected end reading date values")?;
+                        let mut values = Vec::with_capacity(num_rows);
+                        for piece in bytes.chunks_exact(4) {
+                            values.push(i32::from_le_bytes(piece.try_into().unwrap()));
+                        }
+                        Ok(VectorData::Date(values))
+                    }
+                    2 => {
+                        let min_bytes = take_bytes(buffer, 4, "Unexpected end reading FOR min")?;
+                        let min = i32::from_le_bytes(min_bytes.try_into().unwrap());
+                        let bit_width =
+                            take_bytes(buffer, 1, "Unexpected end reading FOR bit width")?[0]
+                                as u32;
+                        if bit_width > 32 {
+                            return Err(format!("Corrupted data: FOR bit width {bit_width} > 32"));
+                        }
+                        let values = BitUnpacker::new(buffer, num_rows, bit_width)?
+                            .map(|delta| min.wrapping_add(delta as i32))
+                            .collect();
+                        Ok(VectorData::Date(values))
+                    }
+                    tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
-                Ok(VectorData::Date(values))
             }
             DataType::Varchar => {
                 // The first byte says which layout follows (EncodingTag).
@@ -729,6 +741,86 @@ impl VectorData {
         }
     }
 }
+// Appends the deltas back to back, bit_width bits each, low bits first:
+// ceil(n * bit_width / 8) bytes. Each delta must fit in bit_width bits.
+fn pack(deltas: impl Iterator<Item = u64>, bit_width: u8, buffer: &mut Vec<u8>) {
+    let bit_width = bit_width as u32;
+    // u128: up to 7 waiting bits + a 64-bit delta = 71 bits.
+    let mut acc: u128 = 0;
+    let mut bits_in_acc: u32 = 0;
+    for delta in deltas {
+        // A stray high bit would silently corrupt the next value.
+        debug_assert!(
+            bit_width == 64 || delta >> bit_width == 0,
+            "delta {delta} needs more than {bit_width} bits"
+        );
+        acc |= (delta as u128) << bits_in_acc;
+        bits_in_acc += bit_width;
+        while bits_in_acc >= 8 {
+            buffer.push(acc as u8);
+            acc >>= 8;
+            bits_in_acc -= 8;
+        }
+    }
+    if bits_in_acc > 0 {
+        buffer.push(acc as u8);
+    }
+}
+
+struct BitUnpacker<'a> {
+    acc: u128,
+    bits_in_acc: u32,
+    bit_width: u32,
+    mask: u128,
+    rows_left: usize,
+    bytes: &'a [u8],
+}
+
+impl<'a> BitUnpacker<'a> {
+    pub fn new(buffer: &mut &'a [u8], num_rows: usize, bit_width: u32) -> Result<Self, String> {
+        if bit_width > 64 {
+            return Err(format!("Corrupted data: FOR bit width {bit_width} > 64"));
+        }
+        let bytes = take_bytes(
+            buffer,
+            (num_rows * bit_width as usize).div_ceil(8),
+            "Unexpected end reading packed values",
+        )?;
+        let mask = (1_u128 << bit_width) - 1;
+        Ok(Self {
+            acc: 0,
+            bits_in_acc: 0,
+            bit_width,
+            mask,
+            rows_left: num_rows,
+            bytes,
+        })
+    }
+}
+
+impl Iterator for BitUnpacker<'_> {
+    type Item = u64;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rows_left == 0 {
+            return None;
+        }
+        while self.bits_in_acc < self.bit_width {
+            let (&first, rest) = self.bytes.split_first()?;
+            self.acc |= (first as u128) << self.bits_in_acc;
+            self.bytes = rest;
+            self.bits_in_acc += 8;
+        }
+        let delta = (self.acc & self.mask) as u64;
+        self.acc >>= self.bit_width;
+        self.bits_in_acc -= self.bit_width;
+        self.rows_left -= 1;
+        Some(delta)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.rows_left, Some(self.rows_left))
+    }
+}
+
 impl Bitmap {
     pub fn encode(&self, buffer: &mut Vec<u8>) {
         self.encode_range(0, self.words.len() * 64, buffer);
@@ -1626,6 +1718,79 @@ mod tests {
             let mut bytes: &[u8] = &buffer[..len];
             assert!(
                 VectorData::decode(&mut bytes, DataType::Int64, 8).is_err(),
+                "len {len}"
+            );
+        }
+    }
+
+    fn date_round_trip(values: &[i32]) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::new();
+        VectorData::Date(values.to_vec()).encode(&mut buffer);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Date, values.len()).unwrap();
+        assert_eq!(decoded, VectorData::Date(values.to_vec()));
+        assert!(bytes.is_empty());
+        buffer
+    }
+
+    #[test]
+    fn encode_date_for_layout() {
+        // QUANTITIES as days: same min, deltas and packed bytes as the Int64 case, 4-byte min.
+        let days: Vec<i32> = QUANTITIES.iter().map(|&q| q as i32).collect();
+        let buffer = date_round_trip(&days);
+        let mut expected = vec![EncodingTag::FrameOfReference as u8];
+        expected.extend_from_slice(&8i32.to_le_bytes()); // min
+        expected.push(6); // bit_width
+        expected.extend_from_slice(&[0x09, 0x07, 0x50, 0x10, 0xE6, 0x95]);
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn encode_date_for_shipdates() {
+        // l_shipdate spans 1992-01-02..1998-12-01: days 8037..10561, a spread of 2524 -> 12 bits.
+        let days: Vec<i32> = (0..100).map(|i| 8037 + (i * 7919) % 2525).collect();
+        let buffer = date_round_trip(&days);
+        assert_eq!(buffer[0], EncodingTag::FrameOfReference as u8);
+        assert_eq!(buffer[5], 12);
+        assert_eq!(buffer.len(), 1 + 4 + 1 + (100 * 12usize).div_ceil(8));
+    }
+
+    #[test]
+    fn encode_date_extremes_pick_plain() {
+        // Spread u32::MAX: correct only if the cast goes through u32, not straight to u64.
+        let buffer = date_round_trip(&[i32::MIN, 0, i32::MAX]);
+        assert_eq!(buffer[0], EncodingTag::Plain as u8);
+        assert_eq!(buffer.len(), 1 + 3 * 4);
+    }
+
+    #[test]
+    fn encode_date_wide_for() {
+        // 31-bit deltas with negative values; enough rows that 1 bit per row beats the header.
+        let days: Vec<i32> = (0..100)
+            .map(|i| if i % 2 == 0 { -1 } else { i32::MAX - i })
+            .collect();
+        let buffer = date_round_trip(&days);
+        assert_eq!(buffer[0], EncodingTag::FrameOfReference as u8);
+        assert_eq!(buffer[5], 31);
+    }
+
+    #[test]
+    fn decode_date_for_bad_bit_width() {
+        let days: Vec<i32> = QUANTITIES.iter().map(|&q| q as i32).collect();
+        let mut buffer = date_round_trip(&days);
+        buffer[5] = 33;
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Date, 8).is_err());
+    }
+
+    #[test]
+    fn decode_date_for_truncated() {
+        let days: Vec<i32> = QUANTITIES.iter().map(|&q| q as i32).collect();
+        let buffer = date_round_trip(&days);
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Date, 8).is_err(),
                 "len {len}"
             );
         }
