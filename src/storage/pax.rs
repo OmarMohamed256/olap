@@ -381,11 +381,14 @@ impl PaxFooter {
     }
 }
 
+// Copy: a one-byte tag is cheap to duplicate, so `encoding as u8` doesn't use it up before the match.
+#[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum EncodingTag {
     Plain = 0,
     Dictionary = 1,
     FrameOfReference = 2,
+    Delta = 3,
 }
 
 // How execution types map to the file layout:
@@ -410,29 +413,67 @@ impl VectorData {
                 let min = v.iter().copied().min().unwrap_or(0);
                 let max = v.iter().copied().max().unwrap_or(0);
                 let spread = max.wrapping_sub(min) as u64;
-                let bit_width = bit_width(spread);
-
+                let bit_width = get_bit_width(spread);
+                let deltas: Vec<i64> = v
+                    .iter()
+                    .skip(1)
+                    .zip(v.iter())
+                    .map(|(&curr, &prev)| curr.wrapping_sub(prev))
+                    .collect();
+                let min_delta = deltas.iter().copied().min().unwrap_or(0);
+                let max_delta = deltas.iter().copied().max().unwrap_or(0);
+                let delta_spread = max_delta.wrapping_sub(min_delta) as u64;
+                let delta_bit_width = get_bit_width(delta_spread);
+                // num_rows - 1 deltas; saturating_sub stops at 0 instead of underflowing on 0 rows.
+                // Plain still wins there (1 byte vs delta's 18-byte header), so delta is never written.
+                let packed_delta_bits = num_rows.saturating_sub(1) * delta_bit_width as usize;
+                // tag + first value + min_delta + bit_width + packed (delta - min_delta)
+                let delta_bytes_size = 1 + 8 + 8 + 1 + packed_delta_bits.div_ceil(8);
                 // tag + values as i64
                 let plain_byte_size = 1 + 8 * num_rows;
                 let packed_bits = num_rows * bit_width as usize;
                 // tag + min + bit_width + packed deltas
                 let frame_of_reference_byte_size = 1 + 8 + 1 + packed_bits.div_ceil(8);
-                if frame_of_reference_byte_size >= plain_byte_size {
-                    buffer.reserve(plain_byte_size);
-                    buffer.push(EncodingTag::Plain as u8);
-                    for &val in v {
-                        buffer.extend_from_slice(&val.to_le_bytes());
+
+                let candidates = [
+                    (plain_byte_size, EncodingTag::Plain),
+                    (frame_of_reference_byte_size, EncodingTag::FrameOfReference),
+                    (delta_bytes_size, EncodingTag::Delta),
+                ];
+                let (byte_size, encoding) = candidates
+                    .into_iter()
+                    .min_by_key(|&(size, _)| size)
+                    .expect("candidates is never empty");
+
+                buffer.reserve(byte_size);
+                buffer.push(encoding as u8);
+                match encoding {
+                    EncodingTag::Plain => {
+                        for &val in v {
+                            buffer.extend_from_slice(&val.to_le_bytes());
+                        }
                     }
-                } else {
-                    buffer.reserve(frame_of_reference_byte_size);
-                    buffer.push(EncodingTag::FrameOfReference as u8);
-                    buffer.extend_from_slice(&min.to_le_bytes());
-                    buffer.push(bit_width);
-                    pack(
-                        v.iter().map(|&x| x.wrapping_sub(min) as u64),
-                        bit_width,
-                        buffer,
-                    );
+                    EncodingTag::FrameOfReference => {
+                        buffer.extend_from_slice(&min.to_le_bytes());
+                        buffer.push(bit_width);
+                        pack(
+                            v.iter().map(|&x| x.wrapping_sub(min) as u64),
+                            bit_width,
+                            buffer,
+                        );
+                    }
+                    EncodingTag::Delta => {
+                        // Delta never wins below 2 rows (its header alone beats plain), so v[0] exists.
+                        buffer.extend_from_slice(&v[0].to_le_bytes());
+                        buffer.extend_from_slice(&min_delta.to_le_bytes());
+                        buffer.push(delta_bit_width);
+                        pack(
+                            deltas.iter().map(|&d| d.wrapping_sub(min_delta) as u64),
+                            delta_bit_width,
+                            buffer,
+                        );
+                    }
+                    EncodingTag::Dictionary => unreachable!("Int64 is never dictionary encoded"),
                 }
             }
             VectorData::Float64(v) => {
@@ -448,30 +489,70 @@ impl VectorData {
                 let min = v.iter().copied().min().unwrap_or(0);
                 let max = v.iter().copied().max().unwrap_or(0);
                 let spread = max.wrapping_sub(min) as u32;
-                let bit_width = bit_width(spread as u64);
+                let bit_width = get_bit_width(spread as u64);
 
+                // Same delta as Int64, with i32 values.
+                let deltas: Vec<i32> = v
+                    .iter()
+                    .skip(1)
+                    .zip(v.iter())
+                    .map(|(&curr, &prev)| curr.wrapping_sub(prev))
+                    .collect();
+                let min_delta = deltas.iter().copied().min().unwrap_or(0);
+                let max_delta = deltas.iter().copied().max().unwrap_or(0);
+                let delta_spread = max_delta.wrapping_sub(min_delta) as u32;
+                let delta_bit_width = get_bit_width(delta_spread as u64);
+                // num_rows - 1 deltas; saturating_sub stops at 0 instead of underflowing on 0 rows.
+                let packed_delta_bits = num_rows.saturating_sub(1) * delta_bit_width as usize;
+                // tag + first value + min_delta + bit_width + packed (delta - min_delta)
+                let delta_bytes_size = 1 + 4 + 4 + 1 + packed_delta_bits.div_ceil(8);
                 // tag + values as i32
                 let plain_byte_size = 1 + 4 * num_rows;
                 let packed_bits = num_rows * bit_width as usize;
                 // tag + min + bit_width + packed deltas
                 let frame_of_reference_byte_size = 1 + 4 + 1 + packed_bits.div_ceil(8);
-                if frame_of_reference_byte_size >= plain_byte_size {
-                    buffer.reserve(plain_byte_size);
-                    buffer.push(EncodingTag::Plain as u8);
-                    for &val in v {
-                        buffer.extend_from_slice(&val.to_le_bytes());
+
+                // Simplest first: min_by_key keeps the first of equal sizes.
+                let candidates = [
+                    (plain_byte_size, EncodingTag::Plain),
+                    (frame_of_reference_byte_size, EncodingTag::FrameOfReference),
+                    (delta_bytes_size, EncodingTag::Delta),
+                ];
+                let (byte_size, encoding) = candidates
+                    .into_iter()
+                    .min_by_key(|&(size, _)| size)
+                    .expect("candidates is never empty");
+
+                buffer.reserve(byte_size);
+                buffer.push(encoding as u8);
+                // Through u32 when packing: a negative i32 cast straight to u64 would sign-extend.
+                match encoding {
+                    EncodingTag::Plain => {
+                        for &val in v {
+                            buffer.extend_from_slice(&val.to_le_bytes());
+                        }
                     }
-                } else {
-                    buffer.reserve(frame_of_reference_byte_size);
-                    buffer.push(EncodingTag::FrameOfReference as u8);
-                    buffer.extend_from_slice(&min.to_le_bytes());
-                    buffer.push(bit_width);
-                    // Through u32: a negative i32 cast straight to u64 would sign-extend.
-                    pack(
-                        v.iter().map(|&x| x.wrapping_sub(min) as u32 as u64),
-                        bit_width,
-                        buffer,
-                    );
+                    EncodingTag::FrameOfReference => {
+                        buffer.extend_from_slice(&min.to_le_bytes());
+                        buffer.push(bit_width);
+                        pack(
+                            v.iter().map(|&x| x.wrapping_sub(min) as u32 as u64),
+                            bit_width,
+                            buffer,
+                        );
+                    }
+                    EncodingTag::Delta => {
+                        // Delta never wins below 2 rows (its header alone beats plain), so v[0] exists.
+                        buffer.extend_from_slice(&v[0].to_le_bytes());
+                        buffer.extend_from_slice(&min_delta.to_le_bytes());
+                        buffer.push(delta_bit_width);
+                        pack(
+                            deltas.iter().map(|&d| d.wrapping_sub(min_delta) as u32 as u64),
+                            delta_bit_width,
+                            buffer,
+                        );
+                    }
+                    EncodingTag::Dictionary => unreachable!("Date is never dictionary encoded"),
                 }
             }
             VectorData::Varchar(string_vector) => {
@@ -507,7 +588,7 @@ impl VectorData {
                             // If the dictionary is too big at the current count, it can't win.
                             if dict_bytes_len(
                                 &distinct_values,
-                                bit_width((distinct_values.len() - 1) as u64) as usize,
+                                get_bit_width((distinct_values.len() - 1) as u64) as usize,
                             ) >= total_plain_bytes_len
                             {
                                 use_plain = true;
@@ -517,7 +598,7 @@ impl VectorData {
                     }
                 }
                 // saturating_sub: 0 rows leave no distinct values, and 0 - 1 would underflow.
-                let bit_width = bit_width(distinct_values.len().saturating_sub(1) as u64);
+                let bit_width = get_bit_width(distinct_values.len().saturating_sub(1) as u64);
                 let total_dict_bytes_len = dict_bytes_len(&distinct_values, bit_width as usize);
 
                 if use_plain || total_dict_bytes_len >= total_plain_bytes_len {
@@ -573,6 +654,29 @@ impl VectorData {
                             .collect();
                         Ok(VectorData::Int64(values))
                     }
+                    3 => {
+                        if num_rows == 0 {
+                            return Err("Corrupted data: delta encoding with 0 rows".to_string());
+                        }
+                        let first_bytes =
+                            take_bytes(buffer, 8, "Unexpected end reading delta first value")?;
+                        let first = i64::from_le_bytes(first_bytes.try_into().unwrap());
+                        let min_delta_bytes =
+                            take_bytes(buffer, 8, "Unexpected end reading min delta")?;
+                        let min_delta = i64::from_le_bytes(min_delta_bytes.try_into().unwrap());
+                        let bit_width =
+                            take_bytes(buffer, 1, "Unexpected end reading delta bit width")?[0]
+                                as u32;
+                        let mut values = Vec::with_capacity(num_rows);
+                        values.push(first);
+                        let mut prev = first;
+                        for packed in BitUnpacker::new(buffer, num_rows - 1, bit_width)? {
+                            // Undo the encoder's two wrapping_subs: FOR on the delta, then the delta.
+                            prev = prev.wrapping_add(min_delta.wrapping_add(packed as i64));
+                            values.push(prev);
+                        }
+                        Ok(VectorData::Int64(values))
+                    }
                     tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
                 }
             }
@@ -608,6 +712,34 @@ impl VectorData {
                         let values = BitUnpacker::new(buffer, num_rows, bit_width)?
                             .map(|delta| min.wrapping_add(delta as i32))
                             .collect();
+                        Ok(VectorData::Date(values))
+                    }
+                    3 => {
+                        // Same delta layout as Int64, with a 4-byte first value and min_delta.
+                        if num_rows == 0 {
+                            return Err("Corrupted data: delta encoding with 0 rows".to_string());
+                        }
+                        let first_bytes =
+                            take_bytes(buffer, 4, "Unexpected end reading delta first value")?;
+                        let first = i32::from_le_bytes(first_bytes.try_into().unwrap());
+                        let min_delta_bytes =
+                            take_bytes(buffer, 4, "Unexpected end reading min delta")?;
+                        let min_delta = i32::from_le_bytes(min_delta_bytes.try_into().unwrap());
+                        let bit_width =
+                            take_bytes(buffer, 1, "Unexpected end reading delta bit width")?[0]
+                                as u32;
+                        if bit_width > 32 {
+                            return Err(format!(
+                                "Corrupted data: delta bit width {bit_width} > 32"
+                            ));
+                        }
+                        let mut values = Vec::with_capacity(num_rows);
+                        values.push(first);
+                        let mut prev = first;
+                        for packed in BitUnpacker::new(buffer, num_rows - 1, bit_width)? {
+                            prev = prev.wrapping_add(min_delta.wrapping_add(packed as i32));
+                            values.push(prev);
+                        }
                         Ok(VectorData::Date(values))
                     }
                     tag => Err(format!("Corrupted data: unknown encoding tag {tag}")),
@@ -682,7 +814,8 @@ impl VectorData {
 
                         let distinct_values =
                             StringVector::from_parts(distinct_offsets, dict_text)?;
-                        let bit_width = bit_width(distinct_values.len().saturating_sub(1) as u64);
+                        let bit_width =
+                            get_bit_width(distinct_values.len().saturating_sub(1) as u64);
                         let codes: Vec<u32> = BitUnpacker::new(buffer, num_rows, bit_width as u32)?
                             .map(|code| code as u32)
                             .collect();
@@ -968,7 +1101,7 @@ impl Vector {
 }
 
 // Bits needed to hold every value up to max_value; 0 when max_value is 0.
-fn bit_width(max_value: u64) -> u8 {
+fn get_bit_width(max_value: u64) -> u8 {
     (u64::BITS - max_value.leading_zeros()) as u8
 }
 
@@ -1676,6 +1809,13 @@ mod tests {
     }
 
     #[test]
+    fn encode_int64_zero_rows_picks_plain() {
+        // No values, no deltas: just the tag. Must not underflow num_rows - 1.
+        let buffer = int64_round_trip(&[]);
+        assert_eq!(buffer, [EncodingTag::Plain as u8]);
+    }
+
+    #[test]
     fn encode_int64_wide_for() {
         // 63-bit deltas: the accumulator holds up to 7 + 63 bits, more than a u64.
         // 100 rows so the 1 bit saved per row beats the 9 extra header bytes.
@@ -1702,6 +1842,101 @@ mod tests {
             let mut bytes: &[u8] = &buffer[..len];
             assert!(
                 VectorData::decode(&mut bytes, DataType::Int64, 8).is_err(),
+                "len {len}"
+            );
+        }
+    }
+
+    // Steps of 1000..=1003: FOR needs 14 bits per value (spread 10,013),
+    // delta needs 2 (deltas 1000..=1003, minus min_delta 1000 -> 0..=3).
+    const STEPPED: [i64; 11] = [
+        0, 1000, 2001, 3004, 4004, 5006, 6007, 7007, 8010, 9012, 10013,
+    ];
+
+    #[test]
+    fn encode_int64_delta_layout() {
+        // delta 21 bytes vs FOR 30 vs plain 89.
+        let buffer = int64_round_trip(&STEPPED);
+        let mut expected = vec![EncodingTag::Delta as u8];
+        expected.extend_from_slice(&0i64.to_le_bytes()); // first value
+        expected.extend_from_slice(&1000i64.to_le_bytes()); // min_delta
+        expected.push(2); // bit_width
+        // 10 deltas - 1000 = 0 1 3 0 2 1 0 3 2 1, 2 bits each, low bits first.
+        expected.extend_from_slice(&[0x34, 0xC6, 0x06]);
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn encode_int64_delta_sorted_with_repeats() {
+        // l_orderkey-like: each key repeats 4 times, keys step by 3.
+        // FOR: spread 747 -> 10 bits. Delta: deltas 0 or 3 -> 2 bits.
+        let values: Vec<i64> = (0..1000).map(|i| i / 4 * 3).collect();
+        let buffer = int64_round_trip(&values);
+        assert_eq!(buffer[0], EncodingTag::Delta as u8);
+        assert_eq!(buffer[17], 2);
+        assert_eq!(buffer.len(), 1 + 8 + 8 + 1 + (999 * 2usize).div_ceil(8));
+    }
+
+    #[test]
+    fn encode_int64_delta_descending() {
+        // Every delta is -7: min_delta is negative, and delta - min_delta is 0 -> 0 bits.
+        let values: Vec<i64> = (0..100).map(|i| 1_000_000 - i * 7).collect();
+        let buffer = int64_round_trip(&values);
+        assert_eq!(buffer[0], EncodingTag::Delta as u8);
+        assert_eq!(&buffer[9..17], &(-7i64).to_le_bytes());
+        assert_eq!(buffer[17], 0);
+        assert_eq!(buffer.len(), 1 + 8 + 8 + 1);
+    }
+
+    #[test]
+    fn encode_int64_delta_extremes_wrap() {
+        // MAX - MIN wraps to -1 and MIN - MAX wraps to 1: deltas -1, 1 -> 2 bits.
+        // FOR would need 64 bits; delta's wrapped deltas are tiny and still round-trip.
+        let buffer = int64_round_trip(&[i64::MIN, i64::MAX, i64::MIN]);
+        let mut expected = vec![EncodingTag::Delta as u8];
+        expected.extend_from_slice(&i64::MIN.to_le_bytes()); // first value
+        expected.extend_from_slice(&(-1i64).to_le_bytes()); // min_delta
+        expected.push(2); // bit_width
+        expected.push(0b10_00); // deltas - min_delta: 0, then 2
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn decode_int64_delta_one_row() {
+        // The encoder picks plain for 1 row, so build the bytes by hand: no packed deltas.
+        let mut buffer = vec![EncodingTag::Delta as u8];
+        buffer.extend_from_slice(&42i64.to_le_bytes());
+        buffer.extend_from_slice(&0i64.to_le_bytes());
+        buffer.push(0);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Int64, 1).unwrap();
+        assert_eq!(decoded, VectorData::Int64(vec![42]));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_int64_delta_zero_rows() {
+        let mut buffer = vec![EncodingTag::Delta as u8];
+        buffer.extend_from_slice(&[0; 17]); // first value, min_delta, bit_width
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, 0).is_err());
+    }
+
+    #[test]
+    fn decode_int64_delta_bad_bit_width() {
+        let mut buffer = int64_round_trip(&STEPPED);
+        buffer[17] = 65;
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Int64, STEPPED.len()).is_err());
+    }
+
+    #[test]
+    fn decode_int64_delta_truncated() {
+        let buffer = int64_round_trip(&STEPPED);
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Int64, STEPPED.len()).is_err(),
                 "len {len}"
             );
         }
@@ -1775,6 +2010,85 @@ mod tests {
             let mut bytes: &[u8] = &buffer[..len];
             assert!(
                 VectorData::decode(&mut bytes, DataType::Date, 8).is_err(),
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_date_delta_layout() {
+        // STEPPED as days: same deltas and packed bytes as the Int64 case, 4-byte header fields.
+        // delta 13 bytes vs FOR 26 vs plain 45.
+        let days: Vec<i32> = STEPPED.iter().map(|&x| x as i32).collect();
+        let buffer = date_round_trip(&days);
+        let mut expected = vec![EncodingTag::Delta as u8];
+        expected.extend_from_slice(&0i32.to_le_bytes()); // first value
+        expected.extend_from_slice(&1000i32.to_le_bytes()); // min_delta
+        expected.push(2); // bit_width
+        expected.extend_from_slice(&[0x34, 0xC6, 0x06]);
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn encode_date_delta_descending() {
+        // One day earlier each row: min_delta -1, every delta - min_delta is 0 -> 0 bits.
+        let days: Vec<i32> = (0..100).map(|i| 10561 - i).collect();
+        let buffer = date_round_trip(&days);
+        assert_eq!(buffer[0], EncodingTag::Delta as u8);
+        assert_eq!(&buffer[5..9], &(-1i32).to_le_bytes());
+        assert_eq!(buffer[9], 0);
+        assert_eq!(buffer.len(), 1 + 4 + 4 + 1);
+    }
+
+    #[test]
+    fn encode_date_delta_extremes_wrap() {
+        // MAX - MIN wraps to -1 and MIN - MAX wraps to 1: deltas -1, 1 -> 2 bits.
+        let buffer = date_round_trip(&[i32::MIN, i32::MAX, i32::MIN]);
+        let mut expected = vec![EncodingTag::Delta as u8];
+        expected.extend_from_slice(&i32::MIN.to_le_bytes()); // first value
+        expected.extend_from_slice(&(-1i32).to_le_bytes()); // min_delta
+        expected.push(2); // bit_width
+        expected.push(0b10_00); // deltas - min_delta: 0, then 2
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn decode_date_delta_one_row() {
+        let mut buffer = vec![EncodingTag::Delta as u8];
+        buffer.extend_from_slice(&8037i32.to_le_bytes());
+        buffer.extend_from_slice(&0i32.to_le_bytes());
+        buffer.push(0);
+        let mut bytes: &[u8] = &buffer;
+        let decoded = VectorData::decode(&mut bytes, DataType::Date, 1).unwrap();
+        assert_eq!(decoded, VectorData::Date(vec![8037]));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_date_delta_zero_rows() {
+        let mut buffer = vec![EncodingTag::Delta as u8];
+        buffer.extend_from_slice(&[0; 9]); // first value, min_delta, bit_width
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Date, 0).is_err());
+    }
+
+    #[test]
+    fn decode_date_delta_bad_bit_width() {
+        let days: Vec<i32> = STEPPED.iter().map(|&x| x as i32).collect();
+        let mut buffer = date_round_trip(&days);
+        buffer[9] = 33;
+        let mut bytes: &[u8] = &buffer;
+        assert!(VectorData::decode(&mut bytes, DataType::Date, days.len()).is_err());
+    }
+
+    #[test]
+    fn decode_date_delta_truncated() {
+        let days: Vec<i32> = STEPPED.iter().map(|&x| x as i32).collect();
+        let buffer = date_round_trip(&days);
+        for len in 0..buffer.len() {
+            let mut bytes: &[u8] = &buffer[..len];
+            assert!(
+                VectorData::decode(&mut bytes, DataType::Date, days.len()).is_err(),
                 "len {len}"
             );
         }
@@ -2128,8 +2442,8 @@ mod tests {
         // Rows 0..64 hold only the NULL at row 3; rows 128..148 hold none.
         let mut buffer: Vec<u8> = Vec::new();
         assert_eq!(vector.encode_range(128, 20, &mut buffer), 0);
-        // Values only, FOR: 128..=147 -> 5 bits each, 100 bits = 13 bytes.
-        assert_eq!(buffer.len(), 1 + 8 + 1 + 13);
+        // Values only, delta: 128..=147 steps by 1 -> every delta - min_delta is 0 -> 0 bits.
+        assert_eq!(buffer.len(), 1 + 8 + 8 + 1);
     }
 
     #[test]
@@ -2297,12 +2611,9 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1].num_rows, 4_464);
         let chunk = &groups[1].chunks_metadata[0];
-        // FOR: group 0 holds 0..=65,535 -> 16 bits; group 1 holds a spread of 4,463 -> 13 bits.
-        assert_eq!(chunk.offset, 4 + 1 + 8 + 1 + 65_536 * 2); // right after group 0
-        assert_eq!(
-            chunk.chunk_length,
-            1 + 8 + 1 + (4_464 * 13usize).div_ceil(8) as u32
-        );
+        // Delta: consecutive values -> every delta is 1 -> 0 bits, just the 18-byte header.
+        assert_eq!(chunk.offset, 4 + 1 + 8 + 8 + 1); // right after group 0
+        assert_eq!(chunk.chunk_length, 1 + 8 + 8 + 1);
         assert_eq!(
             chunk.zone_map,
             Some(ZoneMap {
