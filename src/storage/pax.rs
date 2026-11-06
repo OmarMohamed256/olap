@@ -547,7 +547,9 @@ impl VectorData {
                         buffer.extend_from_slice(&min_delta.to_le_bytes());
                         buffer.push(delta_bit_width);
                         pack(
-                            deltas.iter().map(|&d| d.wrapping_sub(min_delta) as u32 as u64),
+                            deltas
+                                .iter()
+                                .map(|&d| d.wrapping_sub(min_delta) as u32 as u64),
                             delta_bit_width,
                             buffer,
                         );
@@ -2803,12 +2805,12 @@ mod tests {
             for (j, &column) in wanted.iter().enumerate() {
                 assert_eq!(
                     chunk.columns[j],
-                    copy_rows(&columns[column], row, chunk.count),
+                    copy_rows(&columns[column], row, chunk.active_count),
                     "row {row} column {column}"
                 );
             }
-            row += chunk.count;
-            counts.push(chunk.count);
+            row += chunk.active_count;
+            counts.push(chunk.active_count);
         }
         assert_eq!(row, 70_000);
         // Group 0 gives 32 chunks of 2048; group 1 (4,464 rows) gives 2048, 2048, 368.
@@ -2941,10 +2943,10 @@ mod tests {
         while let Some(chunk) = scan.next().unwrap() {
             assert_eq!(
                 chunk.columns[0],
-                copy_rows(&columns[0], row, chunk.count),
+                copy_rows(&columns[0], row, chunk.active_count),
                 "row {row}"
             );
-            row += chunk.count;
+            row += chunk.active_count;
         }
         (row - first_row, scan.skipped_groups())
     }

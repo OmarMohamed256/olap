@@ -117,7 +117,7 @@ fn main() {
     let mut scan = Scan::new(Box::new(PaxFile::open(&pax_path).unwrap()), vec![0], filter);
     let mut rows = 0;
     while let Some(chunk) = scan.next().unwrap() {
-        rows += chunk.count;
+        rows += chunk.active_count;
     }
     println!(
         "pushdown l_orderkey 1..=3: {rows} rows read, {} groups skipped",
@@ -171,7 +171,7 @@ fn drain(mut scan: Scan) -> Result<usize, String> {
     // FREE: each chunk is dropped at the end of the loop body: its Vecs (Varchar: two buffers
     // per column, offsets and bytes).
     while let Some(chunk) = scan.next()? {
-        rows += black_box(&chunk).count;
+        rows += black_box(&chunk).active_count;
     }
     Ok(rows)
 }

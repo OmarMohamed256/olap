@@ -1,6 +1,8 @@
-use std::{cmp::Ordering, ops::Bound};
-
 use crate::catalog::DataType;
+use std::{
+    cmp::Ordering,
+    ops::{Bound, RangeBounds},
+};
 
 pub const VECTOR_SIZE: usize = 2048;
 // Validity of a Vector: bit i = 1 means value i is present, 0 means NULL.
@@ -103,6 +105,24 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Scalar::I64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Scalar::F64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn as_date(&self) -> Option<i32> {
+        match self {
+            Scalar::Date(v) => Some(*v),
+            _ => None,
+        }
+    }
     // None when the two can't be ordered: different types, or a NaN.
     pub fn compare(&self, other: &Scalar) -> Option<Ordering> {
         match (self, other) {
@@ -336,7 +356,8 @@ impl Vector {
 // A PAX row group (65,536 rows) splits into 32 DataChunks.
 pub struct DataChunk {
     pub columns: Vec<Vector>, // one Vector per column, e.g. 16 for SELECT * FROM lineitem
-    pub count: usize,         // how many rows are filled in (≤ 2048)
+    pub active_count: usize,  // number of active rows <= 2048
+    pub selection: Option<Vec<u16>>,
 }
 
 pub trait Operator {
@@ -366,7 +387,6 @@ pub struct Scan {
     current_rows: usize,  // how many rows the loaded group has
     skipped_groups: usize, // groups pushed_filters ruled out, never read
 }
-
 impl Scan {
     pub fn new(
         source: Box<dyn TableSource>,
@@ -387,6 +407,128 @@ impl Scan {
 
     pub fn skipped_groups(&self) -> usize {
         self.skipped_groups
+    }
+}
+
+pub struct SUM {
+    child_operator: Box<dyn Operator>,
+    finished: bool,
+}
+pub struct Filter {
+    child_operator: Box<dyn Operator>,
+    predicates: Vec<ColumnRange>,
+}
+impl Filter {
+    pub fn new(child_operator: Box<dyn Operator>, predicates: Vec<ColumnRange>) -> Self {
+        Filter {
+            child_operator,
+            predicates,
+        }
+    }
+}
+// A predicate's bounds as the column's own type, e.g. Bound<Scalar> -> Bound<i32> with
+// Scalar::as_date, so apply_range compares plain values.
+fn bounds_of<T>(
+    predicate: &ColumnRange,
+    value_of: fn(&Scalar) -> Option<T>,
+) -> Result<(Bound<T>, Bound<T>), String> {
+    let value = |s: &Scalar| {
+        value_of(s).ok_or_else(|| format!("filter bound {s:?} does not match the column type"))
+    };
+    let typed = |bound: &Bound<Scalar>| match bound {
+        Bound::Included(s) => value(s).map(Bound::Included),
+        Bound::Excluded(s) => value(s).map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    };
+    Ok((typed(&predicate.low)?, typed(&predicate.high)?))
+}
+
+fn apply_range<T: PartialOrd + Copy>(
+    values: &[T],
+    validity: &Bitmap,
+    low: Bound<T>,
+    high: Bound<T>,
+    selection: &mut Option<Vec<u16>>,
+) {
+    let range = (low, high);
+    match selection {
+        None => {
+            let mut s = Vec::with_capacity(values.len());
+            for (idx, &value) in values.iter().enumerate() {
+                if validity.is_valid(idx) && range.contains(&value) {
+                    s.push(idx as u16);
+                }
+            }
+            *selection = Some(s);
+        }
+        Some(s) => {
+            s.retain(|&i| {
+                let idx = i as usize;
+                let value = values[idx];
+                validity.is_valid(idx) && range.contains(&value)
+            });
+        }
+    }
+}
+impl Operator for Filter {
+    fn next(&mut self) -> Result<Option<DataChunk>, String> {
+        // for first predicate produce a positional vector
+        while let Some(mut data) = self.child_operator.next()? {
+            // No predicates: nothing to check, every row passes through.
+            let Some(first_predicate) = self.predicates.first() else {
+                return Ok(Some(data));
+            };
+            let first_column_to_match_on = &data.columns[first_predicate.column];
+            let bitmap = &first_column_to_match_on.validity;
+            match &first_column_to_match_on.data {
+                VectorData::Int64(v) => {
+                    let (low, high) = bounds_of(first_predicate, Scalar::as_i64)?;
+
+                    apply_range(v, bitmap, low, high, &mut data.selection);
+                }
+                VectorData::Date(v) => {
+                    let (low, high) = bounds_of(first_predicate, Scalar::as_date)?;
+
+                    apply_range(v, bitmap, low, high, &mut data.selection);
+                }
+                VectorData::Float64(v) => {
+                    let (low, high) = bounds_of(first_predicate, Scalar::as_f64)?;
+
+                    apply_range(v, bitmap, low, high, &mut data.selection);
+                }
+                VectorData::Varchar(v) => {}
+            }
+            // extract needed col values from column using selection vector
+            // and then apply the predicate
+
+            for predicate in &self.predicates[1..] {
+                let col = &data.columns[predicate.column];
+                match &col.data {
+                    VectorData::Int64(v) => {
+                        let (low, high) = bounds_of(predicate, Scalar::as_i64)?;
+                        apply_range(v, &col.validity, low, high, &mut data.selection);
+                    }
+                    VectorData::Date(v) => {
+                        let (low, high) = bounds_of(predicate, Scalar::as_date)?;
+                        apply_range(v, &col.validity, low, high, &mut data.selection);
+                    }
+                    VectorData::Float64(v) => {
+                        let (low, high) = bounds_of(predicate, Scalar::as_f64)?;
+                        apply_range(v, &col.validity, low, high, &mut data.selection);
+                    }
+                    _ => todo!(),
+                }
+            }
+
+            if let Some(selection) = &data.selection {
+                data.active_count = selection.len();
+            }
+            // No rows passed: pull the next chunk, so a chunk from Filter always has rows.
+            if data.active_count > 0 {
+                return Ok(Some(data));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -428,20 +570,252 @@ impl Operator for Scan {
         // cuts each col into 2048 pieces and passes them up the operator tree
         // ALLOC: one Vec<Vector> per DataChunk plus, per column, a bitmap copy and a Vec
         // (fixed width: a copy; Varchar: offsets and one byte range, see StringVector::slice).
-        let columns = self
+        let columns: Vec<Vector> = self
             .current
             .iter_mut()
             .map(|col| col.take_range(self.position, count))
             .collect();
 
         self.position += count;
-        Ok(Some(DataChunk { columns, count }))
+        Ok(Some(DataChunk {
+            columns,
+            active_count: count,
+            selection: None,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Hands out prepared chunks, last one first, so Filter can be tested without a table.
+    struct Chunks(Vec<DataChunk>);
+    impl Operator for Chunks {
+        fn next(&mut self) -> Result<Option<DataChunk>, String> {
+            Ok(self.0.pop())
+        }
+    }
+
+    fn int_vector(values: Vec<i64>, nulls: &[usize]) -> Vector {
+        let mut validity = Bitmap::all_valid(values.len());
+        for &i in nulls {
+            validity.set_null(i);
+        }
+        Vector {
+            data: VectorData::Int64(values),
+            validity,
+        }
+    }
+
+    fn int_chunk(values: Vec<i64>, nulls: &[usize]) -> DataChunk {
+        DataChunk {
+            active_count: values.len(),
+            columns: vec![int_vector(values, nulls)],
+            selection: None,
+        }
+    }
+
+    fn int_range(column: usize, low: Bound<i64>, high: Bound<i64>) -> ColumnRange {
+        ColumnRange {
+            column,
+            low: low.map(Scalar::I64),
+            high: high.map(Scalar::I64),
+        }
+    }
+
+    fn filter(chunks: Vec<DataChunk>, predicates: Vec<ColumnRange>) -> Filter {
+        Filter::new(Box::new(Chunks(chunks)), predicates)
+    }
+
+    #[test]
+    fn filter_some_rows_pass() {
+        use Bound::*;
+        let range = int_range(0, Included(2), Excluded(4));
+        let mut f = filter(vec![int_chunk(vec![1, 2, 3, 4], &[])], vec![range]);
+        let chunk = f.next().unwrap().unwrap();
+        assert_eq!(chunk.selection, Some(vec![1, 2]));
+        assert_eq!(chunk.active_count, 2);
+        assert!(f.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_all_rows_pass() {
+        use Bound::*;
+        let range = int_range(0, Unbounded, Unbounded);
+        let mut f = filter(vec![int_chunk(vec![1, 2], &[])], vec![range]);
+        let chunk = f.next().unwrap().unwrap();
+        assert_eq!(chunk.selection, Some(vec![0, 1]));
+        assert_eq!(chunk.active_count, 2);
+    }
+
+    #[test]
+    fn filter_no_rows_pass_does_not_end_the_data() {
+        use Bound::*;
+        // The chunk with no passing rows comes first; the one after it must still be reached.
+        let chunks = vec![int_chunk(vec![5], &[]), int_chunk(vec![1], &[])];
+        let mut f = filter(chunks, vec![int_range(0, Included(5), Unbounded)]);
+        let mut rows = 0;
+        while let Some(chunk) = f.next().unwrap() {
+            rows += chunk.active_count;
+        }
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn filter_no_predicates_passes_rows_through() {
+        let mut f = filter(vec![int_chunk(vec![1, 2], &[])], vec![]);
+        let chunk = f.next().unwrap().unwrap();
+        assert_eq!(chunk.selection, None);
+        assert_eq!(chunk.active_count, 2);
+    }
+
+    #[test]
+    fn filter_empty_input() {
+        let range = int_range(0, Bound::Unbounded, Bound::Unbounded);
+        assert!(filter(vec![], vec![range]).next().unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_two_predicates_narrow_the_selection() {
+        use Bound::*;
+        let predicates = vec![
+            int_range(0, Included(2), Unbounded),
+            int_range(0, Unbounded, Included(3)),
+        ];
+        let mut f = filter(vec![int_chunk(vec![1, 2, 3, 4], &[])], predicates);
+        let chunk = f.next().unwrap().unwrap();
+        assert_eq!(chunk.selection, Some(vec![1, 2]));
+        assert_eq!(chunk.active_count, 2);
+    }
+
+    #[test]
+    fn filter_null_never_passes() {
+        // Row 1 holds a value inside the range, but it is NULL.
+        let range = int_range(0, Bound::Unbounded, Bound::Unbounded);
+        let mut f = filter(vec![int_chunk(vec![1, 2, 3], &[1])], vec![range]);
+        assert_eq!(f.next().unwrap().unwrap().selection, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn filter_later_predicate_uses_its_own_column_nulls() {
+        use Bound::*;
+        // Only column 1 has a NULL, at row 1; the second predicate must see it.
+        let chunk = DataChunk {
+            active_count: 3,
+            columns: vec![
+                int_vector(vec![1, 2, 3], &[]),
+                int_vector(vec![1, 2, 3], &[1]),
+            ],
+            selection: None,
+        };
+        let predicates = vec![
+            int_range(0, Unbounded, Unbounded),
+            int_range(1, Unbounded, Unbounded),
+        ];
+        let mut f = filter(vec![chunk], predicates);
+        assert_eq!(f.next().unwrap().unwrap().selection, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn filter_respects_incoming_selection() {
+        use Bound::*;
+        // Row 0 is in range but an earlier Filter already rejected it.
+        let mut chunk = int_chunk(vec![1, 2, 3], &[]);
+        chunk.selection = Some(vec![1, 2]);
+        chunk.active_count = 2;
+        let mut f = filter(vec![chunk], vec![int_range(0, Unbounded, Included(2))]);
+        let chunk = f.next().unwrap().unwrap();
+        assert_eq!(chunk.selection, Some(vec![1]));
+        assert_eq!(chunk.active_count, 1);
+    }
+
+    #[test]
+    fn filter_excluded_max_does_not_overflow() {
+        use Bound::*;
+        let range = int_range(0, Unbounded, Excluded(i64::MAX));
+        let mut f = filter(vec![int_chunk(vec![i64::MAX, 0], &[])], vec![range]);
+        assert_eq!(f.next().unwrap().unwrap().selection, Some(vec![1]));
+    }
+
+    #[test]
+    fn filter_float_and_date_columns() {
+        use Bound::*;
+        let chunk = DataChunk {
+            active_count: 3,
+            columns: vec![
+                Vector {
+                    data: VectorData::Float64(vec![0.04, 0.05, 0.07]),
+                    validity: Bitmap::all_valid(3),
+                },
+                Vector {
+                    data: VectorData::Date(vec![10, 20, 30]),
+                    validity: Bitmap::all_valid(3),
+                },
+            ],
+            selection: None,
+        };
+        let predicates = vec![
+            ColumnRange {
+                column: 0,
+                low: Excluded(Scalar::F64(0.04)),
+                high: Unbounded,
+            },
+            ColumnRange {
+                column: 1,
+                low: Unbounded,
+                high: Excluded(Scalar::Date(30)),
+            },
+        ];
+        let mut f = filter(vec![chunk], predicates);
+        assert_eq!(f.next().unwrap().unwrap().selection, Some(vec![1]));
+    }
+
+    #[test]
+    fn filter_date_then_float_columns() {
+        use Bound::*;
+        // Same as above with the types swapped, so each type runs as the first predicate too.
+        let chunk = DataChunk {
+            active_count: 2,
+            columns: vec![
+                Vector {
+                    data: VectorData::Date(vec![10, 20]),
+                    validity: Bitmap::all_valid(2),
+                },
+                Vector {
+                    data: VectorData::Float64(vec![0.5, 1.5]),
+                    validity: Bitmap::all_valid(2),
+                },
+            ],
+            selection: None,
+        };
+        let predicates = vec![
+            ColumnRange {
+                column: 0,
+                low: Included(Scalar::Date(10)),
+                high: Unbounded,
+            },
+            ColumnRange {
+                column: 1,
+                low: Included(Scalar::F64(1.0)),
+                high: Unbounded,
+            },
+        ];
+        let mut f = filter(vec![chunk], predicates);
+        assert_eq!(f.next().unwrap().unwrap().selection, Some(vec![1]));
+    }
+
+    #[test]
+    fn filter_wrong_bound_type_is_an_error() {
+        let range = ColumnRange {
+            column: 0,
+            low: Bound::Included(Scalar::F64(1.0)),
+            high: Bound::Unbounded,
+        };
+        let mut f = filter(vec![int_chunk(vec![1], &[])], vec![range]);
+        let err = f.next().err().unwrap();
+        assert!(err.contains("does not match the column type"), "{err}");
+    }
 
     #[test]
     fn null_count_partial_word() {
