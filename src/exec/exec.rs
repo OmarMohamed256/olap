@@ -410,10 +410,83 @@ impl Scan {
     }
 }
 
-pub struct SUM {
+pub struct Sum {
     child_operator: Box<dyn Operator>,
     finished: bool,
+    left: usize,
+    right: usize,
 }
+impl Sum {
+    pub fn new(child_operator: Box<dyn Operator>, left: usize, right: usize) -> Self {
+        Sum {
+            child_operator,
+            finished: false,
+            left,
+            right,
+        }
+    }
+}
+impl Operator for Sum {
+    fn next(&mut self) -> Result<Option<DataChunk>, String> {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut total = 0.0;
+        let mut has_rows = false; // SUM over no rows is NULL, not 0
+        while let Some(data) = self.child_operator.next()? {
+            match (
+                &data.columns[self.left].data,
+                &data.columns[self.right].data,
+            ) {
+                (VectorData::Float64(left_v), VectorData::Float64(right_v)) => {
+                    let left_bitmap = &data.columns[self.left].validity;
+                    let right_bitmap = &data.columns[self.right].validity;
+
+                    match &data.selection {
+                        Some(s) => {
+                            for &i in s {
+                                let idx = i as usize;
+                                if left_bitmap.is_valid(idx) && right_bitmap.is_valid(idx) {
+                                    total += left_v[idx] * right_v[idx];
+                                    has_rows = true;
+                                }
+                            }
+                        }
+                        None => {
+                            for idx in 0..left_v.len() {
+                                if left_bitmap.is_valid(idx) && right_bitmap.is_valid(idx) {
+                                    total += left_v[idx] * right_v[idx];
+                                    has_rows = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                (left_type, right_type) => {
+                    return Err(format!(
+                        "Unsupported column type combination: {:?} and {:?}",
+                        left_type.data_type(),
+                        right_type.data_type()
+                    ));
+                }
+            }
+        }
+        self.finished = true;
+        let mut validity = Bitmap::all_valid(1);
+        if !has_rows {
+            validity.set_null(0);
+        }
+        Ok(Some(DataChunk {
+            columns: vec![Vector {
+                data: VectorData::Float64(vec![total]),
+                validity,
+            }],
+            active_count: 1,
+            selection: None,
+        }))
+    }
+}
+
 pub struct Filter {
     child_operator: Box<dyn Operator>,
     predicates: Vec<ColumnRange>,
@@ -815,6 +888,109 @@ mod tests {
         let mut f = filter(vec![int_chunk(vec![1], &[])], vec![range]);
         let err = f.next().err().unwrap();
         assert!(err.contains("does not match the column type"), "{err}");
+    }
+
+    fn float_vector(values: Vec<f64>, nulls: &[usize]) -> Vector {
+        let mut validity = Bitmap::all_valid(values.len());
+        for &i in nulls {
+            validity.set_null(i);
+        }
+        Vector {
+            data: VectorData::Float64(values),
+            validity,
+        }
+    }
+
+    fn float_chunk(left: Vector, right: Vector) -> DataChunk {
+        DataChunk {
+            active_count: left.data.len(),
+            columns: vec![left, right],
+            selection: None,
+        }
+    }
+
+    fn sum_of(chunks: Vec<DataChunk>) -> Vector {
+        let mut sum = Sum::new(Box::new(Chunks(chunks)), 0, 1);
+        let mut chunk = sum.next().unwrap().unwrap();
+        assert_eq!(chunk.active_count, 1);
+        chunk.columns.remove(0)
+    }
+
+    #[test]
+    fn sum_multiplies_per_row() {
+        // 1*3 + 2*4 = 11; multiplying the totals would give 3 * 7 = 21.
+        let left = float_vector(vec![1.0, 2.0], &[]);
+        let right = float_vector(vec![3.0, 4.0], &[]);
+        let result = sum_of(vec![float_chunk(left, right)]);
+        assert_eq!(result.data, VectorData::Float64(vec![11.0]));
+        assert!(result.validity.is_valid(0));
+    }
+
+    #[test]
+    fn sum_returns_one_chunk_then_none() {
+        let chunk = float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![1.0], &[]));
+        let mut sum = Sum::new(Box::new(Chunks(vec![chunk])), 0, 1);
+        assert!(sum.next().unwrap().is_some());
+        assert!(sum.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn sum_adds_across_chunks() {
+        let chunks = vec![
+            float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![2.0], &[])),
+            float_chunk(float_vector(vec![3.0], &[]), float_vector(vec![4.0], &[])),
+        ];
+        assert_eq!(sum_of(chunks).data, VectorData::Float64(vec![14.0]));
+    }
+
+    #[test]
+    fn sum_reads_only_selected_rows() {
+        let left = float_vector(vec![1.0, 2.0], &[]);
+        let right = float_vector(vec![3.0, 4.0], &[]);
+        let mut chunk = float_chunk(left, right);
+        chunk.selection = Some(vec![1]);
+        chunk.active_count = 1;
+        assert_eq!(sum_of(vec![chunk]).data, VectorData::Float64(vec![8.0]));
+    }
+
+    #[test]
+    fn sum_skips_a_row_null_in_either_column() {
+        let left = float_vector(vec![1.0, 2.0, 3.0], &[0]);
+        let right = float_vector(vec![1.0, 2.0, 3.0], &[1]);
+        let result = sum_of(vec![float_chunk(left, right)]);
+        assert_eq!(result.data, VectorData::Float64(vec![9.0]));
+    }
+
+    #[test]
+    fn sum_of_no_rows_is_null() {
+        assert!(!sum_of(vec![]).validity.is_valid(0));
+    }
+
+    #[test]
+    fn sum_of_only_null_rows_is_null() {
+        let left = float_vector(vec![1.0], &[0]);
+        let right = float_vector(vec![1.0], &[]);
+        assert!(!sum_of(vec![float_chunk(left, right)]).validity.is_valid(0));
+    }
+
+    #[test]
+    fn sum_of_values_adding_to_zero_is_not_null() {
+        let left = float_vector(vec![1.0, -1.0], &[]);
+        let right = float_vector(vec![1.0, 1.0], &[]);
+        let result = sum_of(vec![float_chunk(left, right)]);
+        assert_eq!(result.data, VectorData::Float64(vec![0.0]));
+        assert!(result.validity.is_valid(0));
+    }
+
+    #[test]
+    fn sum_wrong_column_type_is_an_error() {
+        let chunk = DataChunk {
+            active_count: 1,
+            columns: vec![int_vector(vec![1], &[]), float_vector(vec![1.0], &[])],
+            selection: None,
+        };
+        let mut sum = Sum::new(Box::new(Chunks(vec![chunk])), 0, 1);
+        assert!(sum.next().is_err());
     }
 
     #[test]

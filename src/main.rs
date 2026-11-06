@@ -13,35 +13,58 @@ use sqlparser::ast::{LimitClause, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableSchema};
 use crate::exec::exec::{
-    Bitmap, ColumnRange, Operator, Scalar, Scan, TableSource, Vector, VectorData,
+    Bitmap, ColumnRange, Filter, Operator, Scalar, Scan, Sum, TableSource, Vector, VectorData,
 };
 use crate::storage::csv::{CsvTable, load_csv};
 use crate::storage::pax::{self, PaxFile};
 
 const DATA_DIR: &str = "data/sf0.1";
 
+// l_quantity, l_extendedprice, l_discount, l_shipdate
+const Q6_COLUMNS: [usize; 4] = [4, 5, 6, 10];
+
+// `olap`                  load, then the scan benchmarks, then Q6
+// `olap load`             CSV -> PAX, compare file sizes
+// `olap scans`            CSV vs PAX scan benchmarks
+// `olap q6 [runs]`        time TPC-H Q6 and print its answer
+// `olap pushdown`         how many row groups a filter on l_orderkey skips
+// `olap pax 8,9 [runs]`   only scan those columns, so perf measures one workload
+//                         instead of the whole program (see docs/profiling.md)
+// Everything except `olap` and `olap load` needs the PAX file to exist already.
 fn main() {
-    // CSV -> PAX: load lineitem, write it with our own writer, compare sizes.
     let catalog = Catalog::tpch();
     let schema = catalog.get("lineitem").unwrap();
     let csv_path = format!("{DATA_DIR}/lineitem.csv");
     let pax_path = format!("{DATA_DIR}/lineitem.pax");
 
-    // `olap pax 8,9 [runs]`: only scan those columns of the existing PAX file, so perf
-    // measures one workload instead of the whole program (see docs/profiling.md).
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 3 && args[1] == "pax" {
-        if let Err(e) = pax_only(&pax_path, schema.columns.len(), &args[2], args.get(3)) {
-            println!("error: {e}");
-        }
-        return;
+    let command = args.get(1).map(String::as_str).unwrap_or("all");
+    let result = match command {
+        "all" => load(&csv_path, &pax_path, schema)
+            .and_then(|_| scan_benchmarks(&csv_path, &pax_path, schema))
+            .and_then(|_| q6_benchmark(&pax_path, None)),
+        "load" => load(&csv_path, &pax_path, schema),
+        "scans" => scan_benchmarks(&csv_path, &pax_path, schema),
+        "q6" => q6_benchmark(&pax_path, args.get(2)),
+        "pushdown" => pushdown_demo(&pax_path),
+        "pax" => match args.get(2) {
+            Some(columns) => pax_only(&pax_path, schema.columns.len(), columns, args.get(3)),
+            None => Err("usage: olap pax 8,9 [runs]".to_string()),
+        },
+        other => Err(format!("unknown command: {other}")),
+    };
+    if let Err(e) = result {
+        println!("error: {e}");
     }
+}
 
+// CSV -> PAX: load lineitem, write it with our own writer, compare sizes.
+fn load(csv_path: &str, pax_path: &str, schema: &TableSchema) -> Result<(), String> {
     let start = Instant::now();
     // load_csv gives values only; CSV has no NULLs, so every bitmap is all-valid.
-    let columns: Vec<Vector> = load_csv(&csv_path, schema)
+    let columns: Vec<Vector> = load_csv(csv_path, schema)
         .into_iter()
         .map(|data| {
             let validity = Bitmap::all_valid(data.len());
@@ -55,29 +78,28 @@ fn main() {
     );
 
     let start = Instant::now();
-    if let Err(e) = pax::write(&pax_path, schema, &columns) {
-        println!("write failed: {e}");
-        return;
-    }
+    pax::write(pax_path, schema, &columns).map_err(|e| format!("write failed: {e}"))?;
     println!("write pax: {:?}", start.elapsed());
 
     let parquet_path = format!("{DATA_DIR}/lineitem.parquet");
-    for path in [&csv_path, &parquet_path, &pax_path] {
+    for path in [csv_path, parquet_path.as_str(), pax_path] {
         let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         println!("{path}: {:.1} MB", bytes as f64 / 1e6);
     }
+    Ok(())
+}
 
-    // Times scanning the same columns from CSV and PAX, from disk. Correctness of the data is
-    // checked by tests (pax.rs scan_projects_columns); here only the row counts must agree.
-    // CSV has to be parsed on every query, so its time includes load_csv; PAX includes open.
-    let rows = columns[0].data.len();
-    let csv_bytes = fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
-    let pax_file = PaxFile::open(&pax_path).unwrap();
-    let q6 = vec![4, 5, 6, 10]; // l_quantity, l_extendedprice, l_discount, l_shipdate
+// Times scanning the same columns from CSV and PAX, from disk. Correctness of the data is
+// checked by tests (pax.rs scan_projects_columns); here only the row counts must agree.
+// CSV has to be parsed on every query, so its time includes load_csv; PAX includes open.
+fn scan_benchmarks(csv_path: &str, pax_path: &str, schema: &TableSchema) -> Result<(), String> {
+    let pax_file = PaxFile::open(pax_path)?;
+    let rows = total_rows(&pax_file);
+    let csv_bytes = fs::metadata(csv_path).map(|m| m.len()).unwrap_or(0);
     let all: Vec<usize> = (0..schema.columns.len()).collect();
 
     for (label, scan_columns) in [
-        ("Q6 columns", &q6),
+        ("Q6 columns", &Q6_COLUMNS.to_vec()),
         ("fixed only", &vec![7, 10, 11, 12]),
         ("varchar only", &vec![8, 9, 13]),
         ("all columns", &all),
@@ -85,7 +107,7 @@ fn main() {
         let pax_bytes = pax_file.columns_bytes(scan_columns);
 
         let csv = bench::measure(&format!("csv {label}"), 3, rows, csv_bytes, || {
-            let source = CsvTable::load(&csv_path, schema);
+            let source = CsvTable::load(csv_path, schema);
             drain(Scan::new(
                 Box::new(source),
                 scan_columns.clone(),
@@ -94,7 +116,7 @@ fn main() {
             .unwrap()
         });
         let pax = bench::measure(&format!("pax {label}"), 10, rows, pax_bytes, || {
-            let source = PaxFile::open(&pax_path).unwrap();
+            let source = PaxFile::open(pax_path).unwrap();
             drain(Scan::new(
                 Box::new(source),
                 scan_columns.clone(),
@@ -107,22 +129,83 @@ fn main() {
             "{label}: CSV and PAX scanned different row counts"
         );
     }
+    Ok(())
+}
 
-    // Getting a feel of skipped groups for filter push down
+// Getting a feel of skipped groups for filter push down.
+fn pushdown_demo(pax_path: &str) -> Result<(), String> {
     let filter = vec![ColumnRange {
         column: 0,
         low: Bound::Included(Scalar::I64(1)),
         high: Bound::Included(Scalar::I64(3)),
     }];
-    let mut scan = Scan::new(Box::new(PaxFile::open(&pax_path).unwrap()), vec![0], filter);
+    let mut scan = Scan::new(Box::new(PaxFile::open(pax_path)?), vec![0], filter);
     let mut rows = 0;
-    while let Some(chunk) = scan.next().unwrap() {
+    while let Some(chunk) = scan.next()? {
         rows += chunk.active_count;
     }
     println!(
         "pushdown l_orderkey 1..=3: {rows} rows read, {} groups skipped",
         scan.skipped_groups()
     );
+    Ok(())
+}
+
+// TPC-H Q6 by hand: Scan -> Filter -> Sum. The numbers in `column` and Sum::new are positions
+// in Q6_COLUMNS, not table columns.
+fn q6_plan(pax_path: &str) -> Result<Sum, String> {
+    let scan = Scan::new(
+        Box::new(PaxFile::open(pax_path)?),
+        Q6_COLUMNS.to_vec(),
+        Vec::new(),
+    );
+    let predicates = vec![
+        ColumnRange {
+            column: 0,
+            low: Bound::Unbounded,
+            high: Bound::Excluded(Scalar::F64(24.0)),
+        },
+        ColumnRange {
+            column: 2,
+            low: Bound::Included(Scalar::F64(0.05)),
+            high: Bound::Included(Scalar::F64(0.07)),
+        },
+        ColumnRange {
+            column: 3,
+            low: Bound::Included(Scalar::Date(8766)),
+            high: Bound::Excluded(Scalar::Date(9131)),
+        },
+    ];
+    let filter = Filter::new(Box::new(scan), predicates);
+    Ok(Sum::new(Box::new(filter), 1, 2))
+}
+
+// Times the whole Q6 plan `runs` times (default 20) and prints its answer. Like the PAX scan
+// benchmarks, each run includes opening the file.
+fn q6_benchmark(pax_path: &str, runs: Option<&String>) -> Result<(), String> {
+    let runs = parse_runs(runs)?;
+    let file = PaxFile::open(pax_path)?;
+    let rows = total_rows(&file);
+    let bytes = file.columns_bytes(&Q6_COLUMNS);
+
+    let chunk = bench::measure("q6", runs, rows, bytes, || {
+        q6_plan(pax_path).unwrap().next().unwrap().unwrap()
+    });
+    println!("Q6: {}", chunk.columns[0].data.format(0));
+    Ok(())
+}
+
+fn total_rows(file: &PaxFile) -> usize {
+    (0..file.num_row_groups())
+        .map(|g| file.row_group_num_rows(g))
+        .sum()
+}
+
+fn parse_runs(runs: Option<&String>) -> Result<usize, String> {
+    match runs {
+        Some(r) => r.parse().map_err(|_| format!("bad runs: {r}")),
+        None => Ok(20),
+    }
 }
 
 // Scans `columns` (e.g. "8,9") of the PAX file `runs` times (default 20) and prints the timing.
@@ -137,10 +220,7 @@ fn pax_only(
         .split(',')
         .map(|c| c.trim().parse().map_err(|_| format!("bad column: {c}")))
         .collect::<Result<_, _>>()?;
-    let runs: usize = match runs {
-        Some(r) => r.parse().map_err(|_| format!("bad runs: {r}"))?,
-        None => 20,
-    };
+    let runs = parse_runs(runs)?;
     if let Some(c) = columns.iter().find(|&&c| c >= num_columns) {
         return Err(format!(
             "column {c} out of range: the table has {num_columns}"
@@ -148,9 +228,7 @@ fn pax_only(
     }
 
     let file = PaxFile::open(path)?;
-    let rows = (0..file.num_row_groups())
-        .map(|g| file.row_group_num_rows(g))
-        .sum();
+    let rows = total_rows(&file);
     let bytes = file.columns_bytes(&columns);
 
     let scanned = bench::measure(&format!("pax {columns:?}"), runs, rows, bytes, || {
