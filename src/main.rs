@@ -15,7 +15,8 @@ use sqlparser::parser::Parser;
 
 use crate::catalog::{Catalog, TableSchema};
 use crate::exec::exec::{
-    Bitmap, ColumnRange, Filter, Operator, Scalar, Scan, Sum, TableSource, Vector, VectorData,
+    Bitmap, ColumnRange, Expr, Filter, Operator, Project, Scalar, Scan, Sum, TableSource, Vector,
+    VectorData,
 };
 use crate::storage::csv::{CsvTable, load_csv};
 use crate::storage::pax::{self, PaxFile};
@@ -151,8 +152,9 @@ fn pushdown_demo(pax_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-// TPC-H Q6 by hand: Scan -> Filter -> Sum. The numbers in `column` and Sum::new are positions
-// in Q6_COLUMNS, not table columns.
+// TPC-H Q6 by hand: Scan -> Filter -> Project -> Sum. The numbers in `column` and
+// Expr::Multiply are positions in Q6_COLUMNS, not table columns; Sum adds up Project's
+// only output column.
 fn q6_plan(pax_path: &str) -> Result<Sum, String> {
     let scan = Scan::new(
         Box::new(PaxFile::open(pax_path)?),
@@ -177,7 +179,9 @@ fn q6_plan(pax_path: &str) -> Result<Sum, String> {
         },
     ];
     let filter = Filter::new(Box::new(scan), predicates);
-    Ok(Sum::new(Box::new(filter), 1, 2))
+    let exprs = vec![Expr::Multiply { left: 1, right: 2 }];
+    let project = Project::new(Box::new(filter), exprs);
+    Ok(Sum::new(Box::new(project)))
 }
 
 // Times the whole Q6 plan `runs` times (default 20) and prints its answer. Like the PAX scan

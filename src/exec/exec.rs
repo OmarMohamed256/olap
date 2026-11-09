@@ -92,6 +92,17 @@ impl Bitmap {
         // self.words[i >> 6] &= !(1 << (i & 63));
         self.words[i / 64] &= !(1 << (i % 64));
     }
+    pub fn and(&self, other: &Bitmap) -> Bitmap {
+        assert_eq!(self.words.len(), other.words.len());
+        let words = self
+            .words
+            .iter()
+            .zip(&other.words)
+            .map(|(&a, &b)| a & b)
+            .collect();
+
+        Bitmap { words }
+    }
 }
 // One value of a column, e.g. a zone map min/max or a filter bound.
 // Variants mirror catalog::DataType one-to-one.
@@ -374,7 +385,6 @@ pub trait TableSource {
         true
     }
 }
-
 pub struct Scan {
     source: Box<dyn TableSource>,
     columns: Vec<usize>, // which columns to read, e.g. vec![4, 6] for l_quantity, l_discount
@@ -409,20 +419,68 @@ impl Scan {
         self.skipped_groups
     }
 }
+// Scan(Table) : Dataflow
+// The Scan operator retrieves data vector-at-a-time from the table source
+impl Operator for Scan {
+    fn next(&mut self) -> Result<Option<DataChunk>, String> {
+        // Load the next row group until one has rows left (or none remain).
+        while self.position == self.current_rows {
+            if self.curret_rg == self.source.num_row_groups() {
+                return Ok(None); // every group has been read
+            }
+            // A skipped group changes nothing but curret_rg: position == current_rows still
+            // holds, so the loop moves on instead of handing out the old group's rows again.
+            let may_match = self.source.may_match(self.curret_rg, &self.pushed_filters);
+            if may_match {
+                // FREE: assigning drops the previous group: its large Vecs (munmap), Varchar
+                // included, since each column is just two buffers now.
+                self.current = self.source.read_row_group(self.curret_rg, &self.columns)?;
+                self.current_rows = self.source.row_group_num_rows(self.curret_rg); // same group as the read
+                // Vectors that don't match the source's own row count are a source bug: say so here,
+                // not later as a confusing take_range panic.
+                debug_assert!(
+                    self.current
+                        .iter()
+                        .all(|v| v.data.len() == self.current_rows),
+                    "row group {} returned Vectors that don't have {} rows",
+                    self.curret_rg,
+                    self.current_rows
+                );
+                self.position = 0; // a new group starts at its first row
+            } else {
+                self.skipped_groups += 1;
+            }
+            self.curret_rg += 1;
+        }
+        // Hand out the next piece: up to VECTOR_SIZE rows from position.
+        let count = std::cmp::min(VECTOR_SIZE, self.current_rows - self.position);
+        // cuts each col into 2048 pieces and passes them up the operator tree
+        // ALLOC: one Vec<Vector> per DataChunk plus, per column, a bitmap copy and a Vec
+        // (fixed width: a copy; Varchar: offsets and one byte range, see StringVector::slice).
+        let columns: Vec<Vector> = self
+            .current
+            .iter_mut()
+            .map(|col| col.take_range(self.position, count))
+            .collect();
+
+        self.position += count;
+        Ok(Some(DataChunk {
+            columns,
+            active_count: count,
+            selection: None,
+        }))
+    }
+}
 
 pub struct Sum {
     child_operator: Box<dyn Operator>,
     finished: bool,
-    left: usize,
-    right: usize,
 }
 impl Sum {
-    pub fn new(child_operator: Box<dyn Operator>, left: usize, right: usize) -> Self {
+    pub fn new(child_operator: Box<dyn Operator>) -> Self {
         Sum {
             child_operator,
             finished: false,
-            left,
-            right,
         }
     }
 }
@@ -434,40 +492,35 @@ impl Operator for Sum {
         let mut total = 0.0;
         let mut has_rows = false; // SUM over no rows is NULL, not 0
         while let Some(data) = self.child_operator.next()? {
-            match (
-                &data.columns[self.left].data,
-                &data.columns[self.right].data,
-            ) {
-                (VectorData::Float64(left_v), VectorData::Float64(right_v)) => {
-                    let left_bitmap = &data.columns[self.left].validity;
-                    let right_bitmap = &data.columns[self.right].validity;
-
+            let input = data
+                .columns
+                .first()
+                .ok_or_else(|| "sum input chunk has no columns".to_string())?;
+            match &input.data {
+                VectorData::Float64(column) => {
+                    let bitmap = &input.validity;
                     match &data.selection {
                         Some(s) => {
                             for &i in s {
                                 let idx = i as usize;
-                                if left_bitmap.is_valid(idx) && right_bitmap.is_valid(idx) {
-                                    total += left_v[idx] * right_v[idx];
+                                if bitmap.is_valid(idx) {
+                                    total += column[idx];
                                     has_rows = true;
                                 }
                             }
                         }
                         None => {
-                            for idx in 0..left_v.len() {
-                                if left_bitmap.is_valid(idx) && right_bitmap.is_valid(idx) {
-                                    total += left_v[idx] * right_v[idx];
+                            for idx in 0..column.len() {
+                                if bitmap.is_valid(idx) {
+                                    total += column[idx];
                                     has_rows = true;
                                 }
                             }
                         }
                     }
                 }
-                (left_type, right_type) => {
-                    return Err(format!(
-                        "Unsupported column type combination: {:?} and {:?}",
-                        left_type.data_type(),
-                        right_type.data_type()
-                    ));
+                col_type => {
+                    return Err(format!("cannot sum a {:?} column", col_type.data_type()));
                 }
             }
         }
@@ -496,50 +549,6 @@ impl Filter {
         Filter {
             child_operator,
             predicates,
-        }
-    }
-}
-// A predicate's bounds as the column's own type, e.g. Bound<Scalar> -> Bound<i32> with
-// Scalar::as_date, so apply_range compares plain values.
-fn bounds_of<T>(
-    predicate: &ColumnRange,
-    value_of: fn(&Scalar) -> Option<T>,
-) -> Result<(Bound<T>, Bound<T>), String> {
-    let value = |s: &Scalar| {
-        value_of(s).ok_or_else(|| format!("filter bound {s:?} does not match the column type"))
-    };
-    let typed = |bound: &Bound<Scalar>| match bound {
-        Bound::Included(s) => value(s).map(Bound::Included),
-        Bound::Excluded(s) => value(s).map(Bound::Excluded),
-        Bound::Unbounded => Ok(Bound::Unbounded),
-    };
-    Ok((typed(&predicate.low)?, typed(&predicate.high)?))
-}
-
-fn apply_range<T: PartialOrd + Copy>(
-    values: &[T],
-    validity: &Bitmap,
-    low: Bound<T>,
-    high: Bound<T>,
-    selection: &mut Option<Vec<u16>>,
-) {
-    let range = (low, high);
-    match selection {
-        None => {
-            let mut s = Vec::with_capacity(values.len());
-            for (idx, &value) in values.iter().enumerate() {
-                if validity.is_valid(idx) && range.contains(&value) {
-                    s.push(idx as u16);
-                }
-            }
-            *selection = Some(s);
-        }
-        Some(s) => {
-            s.retain(|&i| {
-                let idx = i as usize;
-                let value = values[idx];
-                validity.is_valid(idx) && range.contains(&value)
-            });
         }
     }
 }
@@ -605,56 +614,104 @@ impl Operator for Filter {
     }
 }
 
-// Scan(Table) : Dataflow
-// The Scan operator retrieves data vector-at-a-time from the table source
-impl Operator for Scan {
-    fn next(&mut self) -> Result<Option<DataChunk>, String> {
-        // Load the next row group until one has rows left (or none remain).
-        while self.position == self.current_rows {
-            if self.curret_rg == self.source.num_row_groups() {
-                return Ok(None); // every group has been read
+// A predicate's bounds as the column's own type, e.g. Bound<Scalar> -> Bound<i32> with
+// Scalar::as_date, so apply_range compares plain values.
+fn bounds_of<T>(
+    predicate: &ColumnRange,
+    value_of: fn(&Scalar) -> Option<T>,
+) -> Result<(Bound<T>, Bound<T>), String> {
+    let value = |s: &Scalar| {
+        value_of(s).ok_or_else(|| format!("filter bound {s:?} does not match the column type"))
+    };
+    let typed = |bound: &Bound<Scalar>| match bound {
+        Bound::Included(s) => value(s).map(Bound::Included),
+        Bound::Excluded(s) => value(s).map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    };
+    Ok((typed(&predicate.low)?, typed(&predicate.high)?))
+}
+fn apply_range<T: PartialOrd + Copy>(
+    values: &[T],
+    validity: &Bitmap,
+    low: Bound<T>,
+    high: Bound<T>,
+    selection: &mut Option<Vec<u16>>,
+) {
+    let range = (low, high);
+    match selection {
+        None => {
+            let mut s = Vec::with_capacity(values.len());
+            for (idx, &value) in values.iter().enumerate() {
+                if validity.is_valid(idx) && range.contains(&value) {
+                    s.push(idx as u16);
+                }
             }
-            // A skipped group changes nothing but curret_rg: position == current_rows still
-            // holds, so the loop moves on instead of handing out the old group's rows again.
-            let may_match = self.source.may_match(self.curret_rg, &self.pushed_filters);
-            if may_match {
-                // FREE: assigning drops the previous group: its large Vecs (munmap), Varchar
-                // included, since each column is just two buffers now.
-                self.current = self.source.read_row_group(self.curret_rg, &self.columns)?;
-                self.current_rows = self.source.row_group_num_rows(self.curret_rg); // same group as the read
-                // Vectors that don't match the source's own row count are a source bug: say so here,
-                // not later as a confusing take_range panic.
-                debug_assert!(
-                    self.current
-                        .iter()
-                        .all(|v| v.data.len() == self.current_rows),
-                    "row group {} returned Vectors that don't have {} rows",
-                    self.curret_rg,
-                    self.current_rows
-                );
-                self.position = 0; // a new group starts at its first row
-            } else {
-                self.skipped_groups += 1;
-            }
-            self.curret_rg += 1;
+            *selection = Some(s);
         }
-        // Hand out the next piece: up to VECTOR_SIZE rows from position.
-        let count = std::cmp::min(VECTOR_SIZE, self.current_rows - self.position);
-        // cuts each col into 2048 pieces and passes them up the operator tree
-        // ALLOC: one Vec<Vector> per DataChunk plus, per column, a bitmap copy and a Vec
-        // (fixed width: a copy; Varchar: offsets and one byte range, see StringVector::slice).
-        let columns: Vec<Vector> = self
-            .current
-            .iter_mut()
-            .map(|col| col.take_range(self.position, count))
-            .collect();
+        Some(s) => {
+            s.retain(|&i| {
+                let idx = i as usize;
+                let value = values[idx];
+                validity.is_valid(idx) && range.contains(&value)
+            });
+        }
+    }
+}
 
-        self.position += count;
-        Ok(Some(DataChunk {
-            columns,
-            active_count: count,
-            selection: None,
-        }))
+// One output column of a Project. left and right are positions in the child's chunks,
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Multiply { left: usize, right: usize },
+}
+pub struct Project {
+    child_operator: Box<dyn Operator>,
+    exprs: Vec<Expr>, // one per output column, in output order
+}
+impl Project {
+    pub fn new(child_operator: Box<dyn Operator>, exprs: Vec<Expr>) -> Self {
+        Project {
+            child_operator,
+            exprs,
+        }
+    }
+}
+impl Operator for Project {
+    fn next(&mut self) -> Result<Option<DataChunk>, String> {
+        // One output chunk per input chunk: Project never skips one, so no loop.
+        let Some(mut data) = self.child_operator.next()? else {
+            return Ok(None);
+        };
+        let mut cols: Vec<Vector> = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            match expr {
+                Expr::Multiply { left, right } => {
+                    let column = |pos: usize| {
+                        data.columns
+                            .get(pos)
+                            .ok_or_else(|| format!("project column {pos} not in chunk"))
+                    };
+                    let (left, right) = (column(*left)?, column(*right)?);
+                    match (&left.data, &right.data) {
+                        (VectorData::Float64(l), VectorData::Float64(r)) => {
+                            let new_col_data = l.iter().zip(r).map(|(&x, &y)| x * y).collect();
+                            cols.push(Vector {
+                                data: VectorData::Float64(new_col_data),
+                                validity: Bitmap::and(&left.validity, &right.validity),
+                            });
+                        }
+                        (l, r) => {
+                            return Err(format!(
+                                "cannot multiply {:?} by {:?}",
+                                l.data_type(),
+                                r.data_type()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        data.columns = cols;
+        Ok(Some(data))
     }
 }
 
@@ -909,27 +966,32 @@ mod tests {
         }
     }
 
+    fn float_column_chunk(values: Vec<f64>, nulls: &[usize]) -> DataChunk {
+        DataChunk {
+            active_count: values.len(),
+            columns: vec![float_vector(values, nulls)],
+            selection: None,
+        }
+    }
+
+    // Sums the chunks' column 0 and returns the one-row result.
     fn sum_of(chunks: Vec<DataChunk>) -> Vector {
-        let mut sum = Sum::new(Box::new(Chunks(chunks)), 0, 1);
+        let mut sum = Sum::new(Box::new(Chunks(chunks)));
         let mut chunk = sum.next().unwrap().unwrap();
         assert_eq!(chunk.active_count, 1);
         chunk.columns.remove(0)
     }
 
     #[test]
-    fn sum_multiplies_per_row() {
-        // 1*3 + 2*4 = 11; multiplying the totals would give 3 * 7 = 21.
-        let left = float_vector(vec![1.0, 2.0], &[]);
-        let right = float_vector(vec![3.0, 4.0], &[]);
-        let result = sum_of(vec![float_chunk(left, right)]);
-        assert_eq!(result.data, VectorData::Float64(vec![11.0]));
+    fn sum_adds_column_zero() {
+        let result = sum_of(vec![float_column_chunk(vec![1.0, 2.0, 3.0], &[])]);
+        assert_eq!(result.data, VectorData::Float64(vec![6.0]));
         assert!(result.validity.is_valid(0));
     }
 
     #[test]
     fn sum_returns_one_chunk_then_none() {
-        let chunk = float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![1.0], &[]));
-        let mut sum = Sum::new(Box::new(Chunks(vec![chunk])), 0, 1);
+        let mut sum = Sum::new(Box::new(Chunks(vec![float_column_chunk(vec![1.0], &[])])));
         assert!(sum.next().unwrap().is_some());
         assert!(sum.next().unwrap().is_none());
     }
@@ -937,28 +999,32 @@ mod tests {
     #[test]
     fn sum_adds_across_chunks() {
         let chunks = vec![
-            float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![2.0], &[])),
-            float_chunk(float_vector(vec![3.0], &[]), float_vector(vec![4.0], &[])),
+            float_column_chunk(vec![1.0, 2.0], &[]),
+            float_column_chunk(vec![3.0], &[]),
         ];
-        assert_eq!(sum_of(chunks).data, VectorData::Float64(vec![14.0]));
+        assert_eq!(sum_of(chunks).data, VectorData::Float64(vec![6.0]));
     }
 
     #[test]
     fn sum_reads_only_selected_rows() {
-        let left = float_vector(vec![1.0, 2.0], &[]);
-        let right = float_vector(vec![3.0, 4.0], &[]);
-        let mut chunk = float_chunk(left, right);
-        chunk.selection = Some(vec![1]);
-        chunk.active_count = 1;
-        assert_eq!(sum_of(vec![chunk]).data, VectorData::Float64(vec![8.0]));
+        let mut chunk = float_column_chunk(vec![1.0, 2.0, 4.0], &[]);
+        chunk.selection = Some(vec![0, 2]);
+        chunk.active_count = 2;
+        assert_eq!(sum_of(vec![chunk]).data, VectorData::Float64(vec![5.0]));
     }
 
     #[test]
-    fn sum_skips_a_row_null_in_either_column() {
-        let left = float_vector(vec![1.0, 2.0, 3.0], &[0]);
-        let right = float_vector(vec![1.0, 2.0, 3.0], &[1]);
-        let result = sum_of(vec![float_chunk(left, right)]);
-        assert_eq!(result.data, VectorData::Float64(vec![9.0]));
+    fn sum_skips_null_rows() {
+        let result = sum_of(vec![float_column_chunk(vec![1.0, 2.0, 4.0], &[1])]);
+        assert_eq!(result.data, VectorData::Float64(vec![5.0]));
+    }
+
+    #[test]
+    fn sum_skips_null_rows_inside_the_selection() {
+        let mut chunk = float_column_chunk(vec![1.0, 2.0, 4.0], &[2]);
+        chunk.selection = Some(vec![1, 2]);
+        chunk.active_count = 2;
+        assert_eq!(sum_of(vec![chunk]).data, VectorData::Float64(vec![2.0]));
     }
 
     #[test]
@@ -968,29 +1034,156 @@ mod tests {
 
     #[test]
     fn sum_of_only_null_rows_is_null() {
-        let left = float_vector(vec![1.0], &[0]);
-        let right = float_vector(vec![1.0], &[]);
-        assert!(!sum_of(vec![float_chunk(left, right)]).validity.is_valid(0));
+        let result = sum_of(vec![float_column_chunk(vec![1.0], &[0])]);
+        assert!(!result.validity.is_valid(0));
     }
 
     #[test]
     fn sum_of_values_adding_to_zero_is_not_null() {
-        let left = float_vector(vec![1.0, -1.0], &[]);
-        let right = float_vector(vec![1.0, 1.0], &[]);
-        let result = sum_of(vec![float_chunk(left, right)]);
+        let result = sum_of(vec![float_column_chunk(vec![1.0, -1.0], &[])]);
         assert_eq!(result.data, VectorData::Float64(vec![0.0]));
         assert!(result.validity.is_valid(0));
     }
 
     #[test]
     fn sum_wrong_column_type_is_an_error() {
+        let mut sum = Sum::new(Box::new(Chunks(vec![int_chunk(vec![1], &[])])));
+        assert!(sum.next().is_err());
+    }
+
+    #[test]
+    fn sum_of_projected_product() {
+        // The Q6 shape without Scan: Project computes left * right, Sum adds it up.
+        // Selected rows 0 and 2: 1*3 + 3*5 = 18 (row 1 would add 2*4 = 8).
+        let mut chunk = float_chunk(
+            float_vector(vec![1.0, 2.0, 3.0], &[]),
+            float_vector(vec![3.0, 4.0, 5.0], &[]),
+        );
+        chunk.selection = Some(vec![0, 2]);
+        chunk.active_count = 2;
+        let project = Project::new(
+            Box::new(Chunks(vec![chunk])),
+            vec![Expr::Multiply { left: 0, right: 1 }],
+        );
+        let mut sum = Sum::new(Box::new(project));
+        let result = sum.next().unwrap().unwrap();
+        assert_eq!(result.columns[0].data, VectorData::Float64(vec![18.0]));
+    }
+
+    fn multiply(left: usize, right: usize) -> Expr {
+        Expr::Multiply { left, right }
+    }
+
+    // Runs one chunk through a Project and returns the single output chunk.
+    fn project_one(chunk: DataChunk, exprs: Vec<Expr>) -> DataChunk {
+        let mut project = Project::new(Box::new(Chunks(vec![chunk])), exprs);
+        let out = project.next().unwrap().unwrap();
+        assert!(project.next().unwrap().is_none());
+        out
+    }
+
+    #[test]
+    fn project_multiplies_every_row() {
+        let chunk = float_chunk(
+            float_vector(vec![1.0, 2.0, 3.0], &[]),
+            float_vector(vec![4.0, 5.0, 6.0], &[]),
+        );
+        let out = project_one(chunk, vec![multiply(0, 1)]);
+        assert_eq!(out.columns.len(), 1); // only the computed column, inputs are dropped
+        assert_eq!(
+            out.columns[0].data,
+            VectorData::Float64(vec![4.0, 10.0, 18.0])
+        );
+        assert_eq!(out.columns[0].validity, Bitmap::all_valid(3));
+        assert_eq!(out.active_count, 3);
+        assert_eq!(out.selection, None);
+    }
+
+    #[test]
+    fn project_keeps_selection_and_row_positions() {
+        let mut chunk = float_chunk(
+            float_vector(vec![1.0, 2.0, 3.0], &[]),
+            float_vector(vec![4.0, 5.0, 6.0], &[]),
+        );
+        chunk.selection = Some(vec![0, 2]);
+        chunk.active_count = 2;
+        let out = project_one(chunk, vec![multiply(0, 1)]);
+        assert_eq!(out.selection, Some(vec![0, 2]));
+        assert_eq!(out.active_count, 2);
+        // Selected rows keep their index: row 2's result is at index 2, not 1.
+        let VectorData::Float64(values) = &out.columns[0].data else {
+            panic!("expected Float64");
+        };
+        assert_eq!((values[0], values[2]), (4.0, 18.0));
+    }
+
+    #[test]
+    fn project_null_in_either_input_is_null() {
+        let chunk = float_chunk(
+            float_vector(vec![1.0, 2.0, 3.0], &[0]),
+            float_vector(vec![1.0, 2.0, 3.0], &[1]),
+        );
+        let out = project_one(chunk, vec![multiply(0, 1)]);
+        let validity = &out.columns[0].validity;
+        assert!(!validity.is_valid(0));
+        assert!(!validity.is_valid(1));
+        assert!(validity.is_valid(2));
+    }
+
+    #[test]
+    fn project_outputs_one_column_per_expr_in_order() {
+        let chunk = float_chunk(float_vector(vec![2.0], &[]), float_vector(vec![3.0], &[]));
+        let out = project_one(chunk, vec![multiply(0, 1), multiply(0, 0), multiply(1, 1)]);
+        let values: Vec<&VectorData> = out.columns.iter().map(|c| &c.data).collect();
+        assert_eq!(
+            values,
+            [
+                &VectorData::Float64(vec![6.0]),
+                &VectorData::Float64(vec![4.0]),
+                &VectorData::Float64(vec![9.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_one_output_chunk_per_input_chunk() {
+        let chunks = vec![
+            float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![2.0], &[])),
+            float_chunk(float_vector(vec![3.0], &[]), float_vector(vec![4.0], &[])),
+        ];
+        let mut project = Project::new(Box::new(Chunks(chunks)), vec![multiply(0, 1)]);
+        // Chunks hands out the last one first.
+        let first = project.next().unwrap().unwrap();
+        assert_eq!(first.columns[0].data, VectorData::Float64(vec![12.0]));
+        let second = project.next().unwrap().unwrap();
+        assert_eq!(second.columns[0].data, VectorData::Float64(vec![2.0]));
+        assert!(project.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn project_empty_input() {
+        let mut project = Project::new(Box::new(Chunks(vec![])), vec![multiply(0, 1)]);
+        assert!(project.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn project_wrong_type_is_an_error() {
         let chunk = DataChunk {
             active_count: 1,
             columns: vec![int_vector(vec![1], &[]), float_vector(vec![1.0], &[])],
             selection: None,
         };
-        let mut sum = Sum::new(Box::new(Chunks(vec![chunk])), 0, 1);
-        assert!(sum.next().is_err());
+        let mut project = Project::new(Box::new(Chunks(vec![chunk])), vec![multiply(0, 1)]);
+        let err = project.next().err().unwrap();
+        assert!(err.contains("cannot multiply Int64 by Float64"), "{err}");
+    }
+
+    #[test]
+    fn project_bad_position_is_an_error() {
+        let chunk = float_chunk(float_vector(vec![1.0], &[]), float_vector(vec![1.0], &[]));
+        let mut project = Project::new(Box::new(Chunks(vec![chunk])), vec![multiply(0, 2)]);
+        let err = project.next().err().unwrap();
+        assert!(err.contains("project column 2 not in chunk"), "{err}");
     }
 
     #[test]
